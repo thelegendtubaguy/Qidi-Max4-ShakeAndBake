@@ -11,6 +11,15 @@ from shakeandbake_max4 import AdapterSnapshot, MotionEnvelope, PreflightRequest,
 from shakeandbake_max4.config import DEFAULT_MAX4_XY_BOUNDS, Max4ConfigSummary, parse_max4_config
 
 SUPPORTED_SHAPER_AXES = ("x", "y")
+BELT_PATH_DIRECTIONS = {
+    "A": (1, -1, 0),
+    "B": (1, 1, 0),
+}
+COMMAND_HELP = {
+    "SHAKEANDBAKE_PREFLIGHT": "Report Shake&Bake Max 4 preflight readiness and metadata.",
+    "SHAKEANDBAKE_CAPTURE_SHAPER": "Capture raw X/Y shaper accelerometer data for external analysis.",
+    "SHAKEANDBAKE_CAPTURE_BELTS": "Capture raw CoreXY A/B belt-path accelerometer data for external analysis.",
+}
 DEFAULT_OUTPUT_DIR = "shakeandbake-captures"
 
 
@@ -33,6 +42,29 @@ class ShaperCaptureParams:
         return {
             "axis": "all" if self.axes == SUPPORTED_SHAPER_AXES else self.axes[0],
             "axes": list(self.axes),
+            "freq_start": self.freq_start,
+            "freq_end": self.freq_end,
+            "hz_per_sec": self.hz_per_sec,
+            "accel_per_hz": self.accel_per_hz,
+            "travel_speed": self.travel_speed,
+            "accel_chip": self.accel_chip,
+            "output_dir": self.output_dir,
+        }
+
+
+@dataclass(frozen=True)
+class BeltCaptureParams:
+    freq_start: float
+    freq_end: float
+    hz_per_sec: float
+    accel_per_hz: float
+    travel_speed: float
+    accel_chip: Optional[str]
+    output_dir: str
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "paths": list(BELT_PATH_DIRECTIONS),
             "freq_start": self.freq_start,
             "freq_end": self.freq_end,
             "hz_per_sec": self.hz_per_sec,
@@ -69,8 +101,15 @@ class KlipperAdapter:
     def register_commands(self, owner: "ShakeAndBake") -> None:
         if self.gcode is None or not hasattr(self.gcode, "register_command"):
             raise CommandError("required Klipper gcode object is unavailable")
-        self.gcode.register_command("SHAKEANDBAKE_PREFLIGHT", owner.cmd_preflight)
-        self.gcode.register_command("SHAKEANDBAKE_CAPTURE_SHAPER", owner.cmd_capture_shaper)
+        self._register_command("SHAKEANDBAKE_PREFLIGHT", owner.cmd_preflight)
+        self._register_command("SHAKEANDBAKE_CAPTURE_SHAPER", owner.cmd_capture_shaper)
+        self._register_command("SHAKEANDBAKE_CAPTURE_BELTS", owner.cmd_capture_belts)
+
+    def _register_command(self, name: str, callback: Any) -> None:
+        try:
+            self.gcode.register_command(name, callback, desc=COMMAND_HELP[name])
+        except TypeError:
+            self.gcode.register_command(name, callback)
 
     def lookup_object(self, name: str, required: bool = True) -> Any:
         if self.printer is None:
@@ -237,6 +276,23 @@ class KlipperAdapter:
         raw_samples = acquire(axis=axis, params=params.as_dict())
         return [Sample.from_value(row) for row in raw_samples]
 
+    def acquire_belt_path_samples(self, path: str, direction: Tuple[int, int, int], params: BeltCaptureParams) -> List[Sample]:
+        accelerometer = self._accelerometer(params.accel_chip)
+        if accelerometer is None:
+            raise CommandError("accelerometer is unavailable")
+        run_path = getattr(self.resonance_tester, "run_belt_path", None)
+        if callable(run_path):
+            run_path(path=path, direction=direction, params=params.as_dict())
+        else:
+            run_axis = getattr(self.resonance_tester, "run_axis", None)
+            if callable(run_axis):
+                run_axis(axis=path.lower(), params={**params.as_dict(), "direction_vector": list(direction)})
+        acquire = getattr(accelerometer, "acquire_samples", None) or getattr(accelerometer, "read_samples", None)
+        if not callable(acquire):
+            raise CommandError("accelerometer sample acquisition method is unavailable")
+        raw_samples = acquire(axis=path.lower(), params={**params.as_dict(), "direction_vector": list(direction)})
+        return [Sample.from_value(row) for row in raw_samples]
+
     def respond(self, gcmd: Any, message: str) -> None:
         responder = getattr(gcmd, "respond_info", None) if gcmd is not None else None
         if callable(responder):
@@ -283,7 +339,7 @@ class KlipperAdapter:
 
 
 class AcquisitionContext:
-    def __init__(self, adapter: KlipperAdapter, params: ShaperCaptureParams):
+    def __init__(self, adapter: KlipperAdapter, params: Any):
         self.adapter = adapter
         self.params = params
         self.input_shaper_snapshot: Mapping[str, Any] = {}
@@ -368,6 +424,45 @@ class ShakeAndBake:
             f"path={write_result.path} measurements={','.join(measurement.name for measurement in measurements)}",
         )
 
+    def cmd_capture_belts(self, gcmd: Any) -> None:
+        params = _parse_belt_params(gcmd, self.max4_config)
+        preflight_request = PreflightRequest(axes=SUPPORTED_SHAPER_AXES, motion_envelope=_belt_planned_envelope(self.max4_config), safety_margin_mm=5.0)
+        preflight_result = run_preflight(preflight_request, self.max4_config, self.adapter)
+        if preflight_result.blocking_findings:
+            codes = ", ".join(finding.code for finding in preflight_result.blocking_findings)
+            raise CommandError(f"Shake&Bake belt preflight failed: {codes}")
+
+        feature_errors = self.adapter.feature_errors()
+        if feature_errors:
+            raise CommandError("Shake&Bake feature detection failed: " + "; ".join(feature_errors))
+
+        measurements: List[MeasurementBlock] = []
+        restoration_status = RestorationStatus()
+        try:
+            with AcquisitionContext(self.adapter, params) as context:
+                for path, direction in BELT_PATH_DIRECTIONS.items():
+                    samples = self.adapter.acquire_belt_path_samples(path, direction, params)
+                    measurements.append(_measurement_for_belt_path(path, direction, samples, params, self.max4_config))
+            restoration_status = context.restoration_status
+        except Exception:
+            restoration_status = getattr(locals().get("context", None), "restoration_status", restoration_status)
+            raise
+        finally:
+            if not restoration_status.ok:
+                self.adapter.respond(gcmd, "Shake&Bake restoration warnings: " + "; ".join(restoration_status.errors))
+
+        artifact = _belt_capture_artifact(params, measurements, self.max4_config, preflight_result, restoration_status)
+        output_path = _belt_output_path(params)
+        write_result = write_capture_artifact(output_path, artifact)
+        if not write_result.ok:
+            codes = ", ".join(d.status_code for d in write_result.validation.diagnostics)
+            raise CommandError(f"belt capture artifact validation failed: {codes}")
+        self.adapter.respond(
+            gcmd,
+            "Shake&Bake belt capture complete: "
+            f"path={write_result.path} measurements={','.join(measurement.name for measurement in measurements)}",
+        )
+
 
 def load_config(config: Any) -> ShakeAndBake:
     return ShakeAndBake(config)
@@ -405,6 +500,23 @@ def _parse_capture_params(gcmd: Any, config: Max4ConfigSummary) -> ShaperCapture
     return ShaperCaptureParams(axes, freq_start, freq_end, hz_per_sec, accel_per_hz, travel_speed, accel_chip, output_dir)
 
 
+def _parse_belt_params(gcmd: Any, config: Max4ConfigSummary) -> BeltCaptureParams:
+    kinematics = (config.printer.kinematics or "").lower()
+    if kinematics and kinematics != "corexy":
+        raise CommandError("SHAKEANDBAKE_CAPTURE_BELTS supports QIDI Max 4 CoreXY kinematics only")
+    axis_raw = _gcmd_get(gcmd, "AXIS", None)
+    if axis_raw is not None:
+        raise CommandError("SHAKEANDBAKE_CAPTURE_BELTS captures CoreXY A/B belt paths only; Z-axis and AXIS parameters are unsupported")
+    freq_start = _gcmd_float(gcmd, "FREQ_START", 5.0, above=0.0)
+    freq_end = _gcmd_float(gcmd, "FREQ_END", 120.0, above=freq_start)
+    hz_per_sec = _gcmd_float(gcmd, "HZ_PER_SEC", 1.0, above=0.0)
+    accel_per_hz = _gcmd_float(gcmd, "ACCEL_PER_HZ", config.resonance_tester.accel_per_hz or 75.0, above=0.0)
+    travel_speed = _gcmd_float(gcmd, "TRAVEL_SPEED", config.printer.max_velocity or 100.0, above=0.0)
+    accel_chip = _gcmd_get(gcmd, "ACCEL_CHIP", config.accelerometer_identity)
+    output_dir = _gcmd_get(gcmd, "OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
+    return BeltCaptureParams(freq_start, freq_end, hz_per_sec, accel_per_hz, travel_speed, accel_chip, output_dir)
+
+
 def _gcmd_get(gcmd: Any, key: str, default: Any) -> Any:
     getter = getattr(gcmd, "get", None)
     if callable(getter):
@@ -427,6 +539,17 @@ def _planned_envelope(config: Max4ConfigSummary) -> MotionEnvelope:
     return MotionEnvelope.around_point(point, radius=10.0)
 
 
+def _belt_planned_envelope(config: Max4ConfigSummary) -> MotionEnvelope:
+    point = config.resonance_tester.primary_probe_point or (162.5, 162.5, 10.0)
+    radius = 10.0
+    return MotionEnvelope(
+        min_x=float(point[0]) - radius,
+        max_x=float(point[0]) + radius,
+        min_y=float(point[1]) - radius,
+        max_y=float(point[1]) + radius,
+    )
+
+
 def _measurement_for_axis(
     axis: str, samples: Sequence[Sample], params: ShaperCaptureParams, config: Max4ConfigSummary
 ) -> MeasurementBlock:
@@ -438,6 +561,32 @@ def _measurement_for_axis(
         samples=list(samples),
         metadata={
             "direction_vector": [1, 0, 0] if axis == "x" else [0, 1, 0],
+            "freq_start": params.freq_start,
+            "freq_end": params.freq_end,
+            "hz_per_sec": params.hz_per_sec,
+            "accel_per_hz": params.accel_per_hz,
+            "travel_speed": params.travel_speed,
+            "accelerometer_object": params.accel_chip or config.accelerometer_identity,
+        },
+    )
+
+
+def _measurement_for_belt_path(
+    path: str,
+    direction: Tuple[int, int, int],
+    samples: Sequence[Sample],
+    params: BeltCaptureParams,
+    config: Max4ConfigSummary,
+) -> MeasurementBlock:
+    return MeasurementBlock(
+        name=f"belt_{path.lower()}",
+        axis=path.lower(),
+        sensor=params.accel_chip or config.accelerometer_identity,
+        sample_rate_hz=None,
+        samples=list(samples),
+        metadata={
+            "path_label": path,
+            "direction_vector": list(direction),
             "freq_start": params.freq_start,
             "freq_end": params.freq_end,
             "hz_per_sec": params.hz_per_sec,
@@ -491,9 +640,58 @@ def _capture_artifact(
     )
 
 
+def _belt_capture_artifact(
+    params: BeltCaptureParams,
+    measurements: Sequence[MeasurementBlock],
+    config: Max4ConfigSummary,
+    preflight_result: Any,
+    restoration_status: RestorationStatus,
+) -> CaptureArtifact:
+    envelope = _belt_planned_envelope(config)
+    state = preflight_result.state
+    return CaptureArtifact(
+        created_at=datetime.now(timezone.utc).isoformat(),
+        command="SHAKEANDBAKE_CAPTURE_BELTS",
+        parameters=params.as_dict(),
+        measurements=list(measurements),
+        metadata={
+            "planned_motion_envelope": {
+                "min_x": envelope.min_x,
+                "max_x": envelope.max_x,
+                "min_y": envelope.min_y,
+                "max_y": envelope.max_y,
+            },
+            "probe_point": list(state.probe_point) if state.probe_point else None,
+            "axes_map": state.axes_map,
+            "input_shaper_state": dict(state.input_shaper_state),
+            "velocity_limit_state": dict(state.velocity_limit_state),
+            "fan_heater_chamber_state": {
+                "fans": dict(state.fan_state),
+                "heaters": dict(state.heater_state),
+                "chamber": dict(state.chamber_state),
+            },
+            "accelerometer_identity": state.accelerometer_identity,
+            "preflight_warnings": [finding.code for finding in preflight_result.warnings],
+            "restoration_status": {
+                "ok": restoration_status.ok,
+                "input_shaper_restored": restoration_status.input_shaper_restored,
+                "velocity_limits_restored": restoration_status.velocity_limits_restored,
+                "errors": list(restoration_status.errors),
+            },
+            "orientation_validation_summary": dict(state.orientation_validation_summary),
+        },
+    )
+
+
 def _output_path(params: ShaperCaptureParams) -> str:
     output_dir = Path(params.output_dir)
     name = f"shaper-{'-'.join(params.axes)}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.sbcapture.json"
+    return str(output_dir / name)
+
+
+def _belt_output_path(params: BeltCaptureParams) -> str:
+    output_dir = Path(params.output_dir)
+    name = f"belts-a-b-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.sbcapture.json"
     return str(output_dir / name)
 
 

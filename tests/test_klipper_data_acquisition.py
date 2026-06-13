@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from dataclasses import replace
 import subprocess
 import sys
 import tempfile
@@ -91,6 +92,8 @@ class FakeAccelerometer:
         self.samples_by_axis = {
             "x": [[0.000, 0.10, 0.02, 9.80], [0.001, 0.15, 0.03, 9.81], [0.002, 0.09, 0.04, 9.79]],
             "y": [[0.000, 0.01, 0.10, 9.80], [0.001, 0.03, 0.15, 9.81], [0.002, 0.02, 0.09, 9.79]],
+            "a": [[0.000, 0.11, -0.10, 9.80], [0.001, 0.16, -0.15, 9.81], [0.002, 0.10, -0.09, 9.79]],
+            "b": [[0.000, 0.11, 0.10, 9.80], [0.001, 0.16, 0.15, 9.81], [0.002, 0.10, 0.09, 9.79]],
         }
 
     def acquire_samples(self, axis, params):
@@ -103,9 +106,10 @@ class FakeResonanceTester:
     def __init__(self) -> None:
         self.moves = []
         self.fail = False
+        self.fail_path = None
 
     def run_axis(self, axis, params) -> None:
-        if self.fail:
+        if self.fail or axis.upper() == self.fail_path:
             raise RuntimeError("motion failure")
         self.moves.append((axis, params))
 
@@ -164,6 +168,7 @@ class KlipperDataAcquisitionTests(unittest.TestCase):
 
         self.assertIn("SHAKEANDBAKE_PREFLIGHT", printer.gcode.commands)
         self.assertIn("SHAKEANDBAKE_CAPTURE_SHAPER", printer.gcode.commands)
+        self.assertIn("SHAKEANDBAKE_CAPTURE_BELTS", printer.gcode.commands)
 
     def test_plugin_import_does_not_import_heavy_or_analyzer_modules(self) -> None:
         script = """
@@ -277,6 +282,126 @@ raise SystemExit(1 if loaded else 0)
                 with context:
                     with self.assertRaises(Exception):
                         plugin.cmd_capture_shaper(FakeGCmd(AXIS="X", OUTPUT_DIR=temp_dir))
+
+                self.assertTrue(printer.input_shaper.state["enabled"])
+                self.assertEqual(printer.toolhead.velocity_limits["max_velocity"], 600.0)
+                self.assertGreaterEqual(printer.input_shaper.restores, 1)
+                self.assertGreaterEqual(printer.toolhead.restores, 1)
+
+    def test_belt_capture_parameter_parsing_and_direction_metadata(self) -> None:
+        printer = FakePrinter()
+        _, plugin = load_plugin(printer)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cmd = FakeGCmd(
+                FREQ_START=12,
+                FREQ_END=88,
+                HZ_PER_SEC=2,
+                ACCEL_PER_HZ=66,
+                TRAVEL_SPEED=140,
+                ACCEL_CHIP="lis2dw",
+                OUTPUT_DIR=temp_dir,
+            )
+
+            plugin.cmd_capture_belts(cmd)
+
+            capture = next(Path(temp_dir).glob("*.sbcapture.json"))
+            data = json.loads(capture.read_text())
+
+        self.assertEqual(data["command"], "SHAKEANDBAKE_CAPTURE_BELTS")
+        self.assertEqual([measurement["name"] for measurement in data["measurements"]], ["belt_a", "belt_b"])
+        self.assertEqual(data["measurements"][0]["metadata"]["path_label"], "A")
+        self.assertEqual(data["measurements"][0]["metadata"]["direction_vector"], [1, -1, 0])
+        self.assertEqual(data["measurements"][1]["metadata"]["path_label"], "B")
+        self.assertEqual(data["measurements"][1]["metadata"]["direction_vector"], [1, 1, 0])
+        for measurement in data["measurements"]:
+            self.assertEqual(measurement["metadata"]["freq_start"], 12.0)
+            self.assertEqual(measurement["metadata"]["freq_end"], 88.0)
+            self.assertEqual(measurement["metadata"]["hz_per_sec"], 2.0)
+            self.assertEqual(measurement["metadata"]["accel_per_hz"], 66.0)
+            self.assertEqual(measurement["metadata"]["travel_speed"], 140.0)
+        self.assertIn("belt capture complete", cmd.responses[0])
+        self.assertNotIn("PSD", cmd.responses[0])
+        self.assertNotIn("similarity", cmd.responses[0])
+        self.assertNotIn("graph", cmd.responses[0])
+        self.assertNotIn("health", cmd.responses[0])
+
+    def test_belt_capture_refuses_unsafe_states_out_of_bounds_and_axis_semantics(self) -> None:
+        unsafe_states = [
+            ("printing", "printing"),
+            ("paused", "paused"),
+            ("virtual_sd_active", "virtual_sd_active"),
+            ("homing", "homing"),
+            ("ready", "printer_not_ready"),
+        ]
+        for attr, code in unsafe_states:
+            with self.subTest(attr=attr):
+                printer = FakePrinter()
+                if attr == "ready":
+                    printer.ready = False
+                else:
+                    setattr(printer, attr, True)
+                module, plugin = load_plugin(printer)
+
+                with self.assertRaisesRegex(module.CommandError, code):
+                    plugin.cmd_capture_belts(FakeGCmd(OUTPUT_DIR=tempfile.gettempdir()))
+                self.assertEqual(printer.resonance_tester.moves, [])
+
+        printer = FakePrinter()
+        module, plugin = load_plugin(printer)
+        with self.assertRaisesRegex(module.CommandError, "AXIS parameters are unsupported"):
+            plugin.cmd_capture_belts(FakeGCmd(AXIS="Z", OUTPUT_DIR=tempfile.gettempdir()))
+        self.assertEqual(printer.resonance_tester.moves, [])
+
+        printer = FakePrinter()
+        module, plugin = load_plugin(printer)
+        plugin.max4_config = replace(plugin.max4_config, xy_bounds=(0.0, 100.0, 0.0, 100.0))
+        with self.assertRaisesRegex(module.CommandError, "motion_envelope_out_of_bounds"):
+            plugin.cmd_capture_belts(FakeGCmd(OUTPUT_DIR=tempfile.gettempdir()))
+        self.assertEqual(printer.resonance_tester.moves, [])
+
+        printer = FakePrinter()
+        module, plugin = load_plugin(printer)
+        plugin.max4_config = replace(plugin.max4_config, printer=replace(plugin.max4_config.printer, kinematics="cartesian"))
+        with self.assertRaisesRegex(module.CommandError, "CoreXY"):
+            plugin.cmd_capture_belts(FakeGCmd(OUTPUT_DIR=tempfile.gettempdir()))
+        self.assertEqual(printer.resonance_tester.moves, [])
+
+    def test_successful_belt_capture_artifact_creation(self) -> None:
+        printer = FakePrinter()
+        _, plugin = load_plugin(printer)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cmd = FakeGCmd(OUTPUT_DIR=temp_dir)
+            plugin.cmd_capture_belts(cmd)
+            capture = next(Path(temp_dir).glob("*.sbcapture.json"))
+            data = json.loads(capture.read_text())
+
+        self.assertEqual(data["command"], "SHAKEANDBAKE_CAPTURE_BELTS")
+        self.assertEqual([measurement["metadata"]["path_label"] for measurement in data["measurements"]], ["A", "B"])
+        self.assertIn("planned_motion_envelope", data["metadata"])
+        self.assertIn("probe_point", data["metadata"])
+        self.assertIn("axes_map", data["metadata"])
+        self.assertIn("input_shaper_state", data["metadata"])
+        self.assertIn("velocity_limit_state", data["metadata"])
+        self.assertTrue(data["metadata"]["restoration_status"]["ok"])
+        self.assertTrue(printer.input_shaper.state["enabled"])
+        self.assertEqual(printer.toolhead.velocity_limits["max_velocity"], 600.0)
+
+    def test_forced_belt_capture_and_writing_failures_restore_state(self) -> None:
+        cases = ["a_motion", "b_motion", "writing"]
+        for failure in cases:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp_dir:
+                printer = FakePrinter()
+                module, plugin = load_plugin(printer)
+                if failure == "a_motion":
+                    printer.resonance_tester.fail_path = "A"
+                if failure == "b_motion":
+                    printer.resonance_tester.fail_path = "B"
+
+                patcher = mock.patch.object(module, "write_capture_artifact", side_effect=RuntimeError("write failure"))
+                context = patcher if failure == "writing" else _null_context()
+                with context:
+                    with self.assertRaises(Exception):
+                        plugin.cmd_capture_belts(FakeGCmd(OUTPUT_DIR=temp_dir))
 
                 self.assertTrue(printer.input_shaper.state["enabled"])
                 self.assertEqual(printer.toolhead.velocity_limits["max_velocity"], 600.0)

@@ -5,6 +5,7 @@ import sys
 
 from .belts import BeltAnalysisOptions, analyze_belt_capture
 from .shaper import ShaperAnalysisOptions, analyze_shaper_capture
+from .static_frequency import StaticFrequencyAnalysisOptions, analyze_static_frequency_capture
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,6 +28,12 @@ def build_parser() -> argparse.ArgumentParser:
     belts.add_argument("--peak-absolute-threshold", type=float, default=1e-12)
     belts.add_argument("--no-graphs", action="store_true")
     belts.add_argument("--json-only", action="store_true")
+    static = analyze_subcommands.add_parser("static-frequency")
+    static.add_argument("capture_file")
+    static.add_argument("--output-dir", required=True)
+    static.add_argument("--segment-seconds", type=float, default=0.25)
+    static.add_argument("--no-graphs", action="store_true")
+    static.add_argument("--json-only", action="store_true")
     return parser
 
 
@@ -57,6 +64,17 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         return 0 if result.comparison_valid else 2
+    if args.command == "analyze" and args.analysis == "static-frequency":
+        result = analyze_static_frequency_capture(
+            args.capture_file,
+            args.output_dir,
+            StaticFrequencyAnalysisOptions(
+                segment_seconds=args.segment_seconds,
+                graphs_enabled=not args.no_graphs and not args.json_only,
+                json_only=args.json_only,
+            ),
+        )
+        return 0 if result.analysis_valid else 2
     return 2
 
 

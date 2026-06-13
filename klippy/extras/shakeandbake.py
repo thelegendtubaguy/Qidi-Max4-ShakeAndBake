@@ -15,10 +15,17 @@ BELT_PATH_DIRECTIONS = {
     "A": (1, -1, 0),
     "B": (1, 1, 0),
 }
+STATIC_EXCITE_DIRECTIONS = {
+    "X": (1, 0, 0),
+    "Y": (0, 1, 0),
+    "A": (1, -1, 0),
+    "B": (1, 1, 0),
+}
 COMMAND_HELP = {
     "SHAKEANDBAKE_PREFLIGHT": "Report Shake&Bake Max 4 preflight readiness and metadata.",
     "SHAKEANDBAKE_CAPTURE_SHAPER": "Capture raw X/Y shaper accelerometer data for external analysis.",
     "SHAKEANDBAKE_CAPTURE_BELTS": "Capture raw CoreXY A/B belt-path accelerometer data for external analysis.",
+    "SHAKEANDBAKE_EXCITE": "Run fixed-frequency X/Y/A/B excitation with optional raw accelerometer recording.",
 }
 DEFAULT_OUTPUT_DIR = "shakeandbake-captures"
 
@@ -76,6 +83,32 @@ class BeltCaptureParams:
 
 
 @dataclass(frozen=True)
+class StaticExciteParams:
+    axis: str
+    direction: Tuple[int, int, int]
+    frequency: float
+    duration: float
+    accel_per_hz: float
+    travel_speed: float
+    accel_chip: Optional[str]
+    record: bool
+    output_dir: str
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "axis": self.axis,
+            "direction_vector": list(self.direction),
+            "frequency": self.frequency,
+            "duration": self.duration,
+            "accel_per_hz": self.accel_per_hz,
+            "travel_speed": self.travel_speed,
+            "accel_chip": self.accel_chip,
+            "record": int(self.record),
+            "output_dir": self.output_dir,
+        }
+
+
+@dataclass(frozen=True)
 class RestorationStatus:
     input_shaper_restored: bool = True
     velocity_limits_restored: bool = True
@@ -104,6 +137,7 @@ class KlipperAdapter:
         self._register_command("SHAKEANDBAKE_PREFLIGHT", owner.cmd_preflight)
         self._register_command("SHAKEANDBAKE_CAPTURE_SHAPER", owner.cmd_capture_shaper)
         self._register_command("SHAKEANDBAKE_CAPTURE_BELTS", owner.cmd_capture_belts)
+        self._register_command("SHAKEANDBAKE_EXCITE", owner.cmd_excite)
 
     def _register_command(self, name: str, callback: Any) -> None:
         try:
@@ -293,6 +327,25 @@ class KlipperAdapter:
         raw_samples = acquire(axis=path.lower(), params={**params.as_dict(), "direction_vector": list(direction)})
         return [Sample.from_value(row) for row in raw_samples]
 
+    def run_static_excitation(self, params: StaticExciteParams) -> None:
+        runner = getattr(self.resonance_tester, "run_static_frequency", None)
+        if callable(runner):
+            runner(axis=params.axis, direction=params.direction, params=params.as_dict())
+            return
+        runner = getattr(self.resonance_tester, "run_axis", None)
+        if callable(runner):
+            runner(axis=params.axis.lower(), params=params.as_dict())
+
+    def record_static_samples(self, params: StaticExciteParams) -> List[Sample]:
+        accelerometer = self._accelerometer(params.accel_chip)
+        if accelerometer is None:
+            raise CommandError("accelerometer is unavailable")
+        acquire = getattr(accelerometer, "acquire_samples", None) or getattr(accelerometer, "read_samples", None)
+        if not callable(acquire):
+            raise CommandError("accelerometer sample acquisition method is unavailable")
+        raw_samples = acquire(axis=params.axis.lower(), params=params.as_dict())
+        return [Sample.from_value(row) for row in raw_samples]
+
     def respond(self, gcmd: Any, message: str) -> None:
         responder = getattr(gcmd, "respond_info", None) if gcmd is not None else None
         if callable(responder):
@@ -463,6 +516,41 @@ class ShakeAndBake:
             f"path={write_result.path} measurements={','.join(measurement.name for measurement in measurements)}",
         )
 
+    def cmd_excite(self, gcmd: Any) -> None:
+        params = _parse_static_excite_params(gcmd, self.max4_config)
+        preflight_request = PreflightRequest(axes=("x", "y"), motion_envelope=_static_planned_envelope(self.max4_config), safety_margin_mm=5.0)
+        preflight_result = run_preflight(preflight_request, self.max4_config, self.adapter)
+        if preflight_result.blocking_findings:
+            codes = ", ".join(finding.code for finding in preflight_result.blocking_findings)
+            raise CommandError(f"Shake&Bake excitation preflight failed: {codes}")
+        feature_errors = self.adapter.feature_errors()
+        if params.record and feature_errors:
+            raise CommandError("Shake&Bake feature detection failed: " + "; ".join(feature_errors))
+        restoration_status = RestorationStatus()
+        samples: List[Sample] = []
+        try:
+            with AcquisitionContext(self.adapter, params) as context:
+                self.adapter.run_static_excitation(params)
+                if params.record:
+                    samples = self.adapter.record_static_samples(params)
+            restoration_status = context.restoration_status
+        except Exception:
+            restoration_status = getattr(locals().get("context", None), "restoration_status", restoration_status)
+            raise
+        finally:
+            if not restoration_status.ok:
+                self.adapter.respond(gcmd, "Shake&Bake restoration warnings: " + "; ".join(restoration_status.errors))
+        if params.record:
+            measurement = _measurement_for_static_excitation(params, samples, self.max4_config)
+            artifact = _static_capture_artifact(params, [measurement], self.max4_config, preflight_result, restoration_status)
+            write_result = write_capture_artifact(_static_output_path(params), artifact)
+            if not write_result.ok:
+                codes = ", ".join(d.status_code for d in write_result.validation.diagnostics)
+                raise CommandError(f"static-frequency capture artifact validation failed: {codes}")
+            self.adapter.respond(gcmd, f"Shake&Bake excitation complete: path={write_result.path} measurements={measurement.name}")
+        else:
+            self.adapter.respond(gcmd, f"Shake&Bake excitation complete: axis={params.axis} frequency={params.frequency} duration={params.duration}")
+
 
 def load_config(config: Any) -> ShakeAndBake:
     return ShakeAndBake(config)
@@ -517,6 +605,24 @@ def _parse_belt_params(gcmd: Any, config: Max4ConfigSummary) -> BeltCaptureParam
     return BeltCaptureParams(freq_start, freq_end, hz_per_sec, accel_per_hz, travel_speed, accel_chip, output_dir)
 
 
+def _parse_static_excite_params(gcmd: Any, config: Max4ConfigSummary) -> StaticExciteParams:
+    axis = str(_gcmd_get(gcmd, "AXIS", "")).upper()
+    if axis not in STATIC_EXCITE_DIRECTIONS:
+        raise CommandError("Max 4 Shake&Bake excitation supports AXIS=X, AXIS=Y, AXIS=A, or AXIS=B only")
+    frequency = _gcmd_float(gcmd, "FREQUENCY", None, above=0.0)
+    duration = _gcmd_float(gcmd, "DURATION", None, above=0.0)
+    if frequency > 200.0:
+        raise CommandError("FREQUENCY exceeds the supported static excitation limit")
+    if duration > 120.0:
+        raise CommandError("DURATION exceeds the supported static excitation limit")
+    accel_per_hz = _gcmd_float(gcmd, "ACCEL_PER_HZ", config.resonance_tester.accel_per_hz or 75.0, above=0.0)
+    travel_speed = _gcmd_float(gcmd, "TRAVEL_SPEED", config.printer.max_velocity or 100.0, above=0.0)
+    accel_chip = _gcmd_get(gcmd, "ACCEL_CHIP", config.accelerometer_identity)
+    record = _gcmd_bool(gcmd, "RECORD", False)
+    output_dir = _gcmd_get(gcmd, "OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
+    return StaticExciteParams(axis, STATIC_EXCITE_DIRECTIONS[axis], frequency, duration, accel_per_hz, travel_speed, accel_chip, record, output_dir)
+
+
 def _gcmd_get(gcmd: Any, key: str, default: Any) -> Any:
     getter = getattr(gcmd, "get", None)
     if callable(getter):
@@ -524,14 +630,31 @@ def _gcmd_get(gcmd: Any, key: str, default: Any) -> Any:
     return getattr(gcmd, key.lower(), default)
 
 
-def _gcmd_float(gcmd: Any, key: str, default: float, above: Optional[float] = None) -> float:
+def _gcmd_float(gcmd: Any, key: str, default: Optional[float], above: Optional[float] = None) -> float:
     getter = getattr(gcmd, "get_float", None)
-    if callable(getter):
-        return float(getter(key, default, above=above))
-    value = float(_gcmd_get(gcmd, key, default))
+    try:
+        if callable(getter):
+            return float(getter(key, default, above=above))
+        raw = _gcmd_get(gcmd, key, default)
+        if raw is None:
+            raise ValueError(f"{key} is required")
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise CommandError(f"invalid {key}: {exc}") from exc
     if above is not None and value <= above:
         raise CommandError(f"{key} must be greater than {above}")
     return value
+
+
+def _gcmd_bool(gcmd: Any, key: str, default: bool) -> bool:
+    value = _gcmd_get(gcmd, key, int(default))
+    if isinstance(value, bool):
+        return value
+    if str(value).strip() in ("1", "true", "TRUE", "yes", "YES"):
+        return True
+    if str(value).strip() in ("0", "false", "FALSE", "no", "NO"):
+        return False
+    raise CommandError(f"{key} must be 0 or 1")
 
 
 def _planned_envelope(config: Max4ConfigSummary) -> MotionEnvelope:
@@ -548,6 +671,11 @@ def _belt_planned_envelope(config: Max4ConfigSummary) -> MotionEnvelope:
         min_y=float(point[1]) - radius,
         max_y=float(point[1]) + radius,
     )
+
+
+def _static_planned_envelope(config: Max4ConfigSummary) -> MotionEnvelope:
+    point = config.resonance_tester.primary_probe_point or (162.5, 162.5, 10.0)
+    return MotionEnvelope.around_point(point, radius=10.0)
 
 
 def _measurement_for_axis(
@@ -640,6 +768,29 @@ def _capture_artifact(
     )
 
 
+def _measurement_for_static_excitation(
+    params: StaticExciteParams,
+    samples: Sequence[Sample],
+    config: Max4ConfigSummary,
+) -> MeasurementBlock:
+    return MeasurementBlock(
+        name=f"static_{params.axis.lower()}",
+        axis=params.axis.lower(),
+        sensor=params.accel_chip or config.accelerometer_identity,
+        sample_rate_hz=None,
+        samples=list(samples),
+        metadata={
+            "axis_label": params.axis,
+            "direction_vector": list(params.direction),
+            "frequency": params.frequency,
+            "duration": params.duration,
+            "accel_per_hz": params.accel_per_hz,
+            "travel_speed": params.travel_speed,
+            "accelerometer_object": params.accel_chip or config.accelerometer_identity,
+        },
+    )
+
+
 def _belt_capture_artifact(
     params: BeltCaptureParams,
     measurements: Sequence[MeasurementBlock],
@@ -683,6 +834,36 @@ def _belt_capture_artifact(
     )
 
 
+def _static_capture_artifact(
+    params: StaticExciteParams,
+    measurements: Sequence[MeasurementBlock],
+    config: Max4ConfigSummary,
+    preflight_result: Any,
+    restoration_status: RestorationStatus,
+) -> CaptureArtifact:
+    envelope = _static_planned_envelope(config)
+    state = preflight_result.state
+    return CaptureArtifact(
+        created_at=datetime.now(timezone.utc).isoformat(),
+        command="SHAKEANDBAKE_EXCITE",
+        parameters=params.as_dict(),
+        measurements=list(measurements),
+        metadata={
+            "planned_motion_envelope": {"min_x": envelope.min_x, "max_x": envelope.max_x, "min_y": envelope.min_y, "max_y": envelope.max_y},
+            "probe_point": list(state.probe_point) if state.probe_point else None,
+            "axes_map": state.axes_map,
+            "input_shaper_state": dict(state.input_shaper_state),
+            "velocity_limit_state": dict(state.velocity_limit_state),
+            "fan_heater_chamber_state": {"fans": dict(state.fan_state), "heaters": dict(state.heater_state), "chamber": dict(state.chamber_state)},
+            "accelerometer_identity": state.accelerometer_identity,
+            "preflight_warnings": [finding.code for finding in preflight_result.warnings],
+            "restoration_status": {"ok": restoration_status.ok, "input_shaper_restored": restoration_status.input_shaper_restored, "velocity_limits_restored": restoration_status.velocity_limits_restored, "errors": list(restoration_status.errors)},
+            "orientation_validation_summary": dict(state.orientation_validation_summary),
+        },
+        tool="static-frequency",
+    )
+
+
 def _output_path(params: ShaperCaptureParams) -> str:
     output_dir = Path(params.output_dir)
     name = f"shaper-{'-'.join(params.axes)}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.sbcapture.json"
@@ -692,6 +873,12 @@ def _output_path(params: ShaperCaptureParams) -> str:
 def _belt_output_path(params: BeltCaptureParams) -> str:
     output_dir = Path(params.output_dir)
     name = f"belts-a-b-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.sbcapture.json"
+    return str(output_dir / name)
+
+
+def _static_output_path(params: StaticExciteParams) -> str:
+    output_dir = Path(params.output_dir)
+    name = f"static-{params.axis.lower()}-{params.frequency:g}hz-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.sbcapture.json"
     return str(output_dir / name)
 
 

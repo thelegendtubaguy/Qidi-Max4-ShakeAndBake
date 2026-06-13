@@ -169,6 +169,7 @@ class KlipperDataAcquisitionTests(unittest.TestCase):
         self.assertIn("SHAKEANDBAKE_PREFLIGHT", printer.gcode.commands)
         self.assertIn("SHAKEANDBAKE_CAPTURE_SHAPER", printer.gcode.commands)
         self.assertIn("SHAKEANDBAKE_CAPTURE_BELTS", printer.gcode.commands)
+        self.assertIn("SHAKEANDBAKE_EXCITE", printer.gcode.commands)
 
     def test_plugin_import_does_not_import_heavy_or_analyzer_modules(self) -> None:
         script = """
@@ -403,6 +404,72 @@ raise SystemExit(1 if loaded else 0)
                     with self.assertRaises(Exception):
                         plugin.cmd_capture_belts(FakeGCmd(OUTPUT_DIR=temp_dir))
 
+                self.assertTrue(printer.input_shaper.state["enabled"])
+                self.assertEqual(printer.toolhead.velocity_limits["max_velocity"], 600.0)
+                self.assertGreaterEqual(printer.input_shaper.restores, 1)
+                self.assertGreaterEqual(printer.toolhead.restores, 1)
+
+    def test_static_frequency_parameter_validation_and_axis_mapping(self) -> None:
+        printer = FakePrinter()
+        module, plugin = load_plugin(printer)
+        with self.assertRaisesRegex(module.CommandError, "FREQUENCY"):
+            plugin.cmd_excite(FakeGCmd(AXIS="X", DURATION=1, OUTPUT_DIR=tempfile.gettempdir()))
+        with self.assertRaisesRegex(module.CommandError, "DURATION"):
+            plugin.cmd_excite(FakeGCmd(AXIS="X", FREQUENCY=40, OUTPUT_DIR=tempfile.gettempdir()))
+        with self.assertRaisesRegex(module.CommandError, "supports AXIS=X"):
+            plugin.cmd_excite(FakeGCmd(AXIS="Z", FREQUENCY=40, DURATION=1, OUTPUT_DIR=tempfile.gettempdir()))
+        for axis, vector in {"X": [1, 0, 0], "Y": [0, 1, 0], "A": [1, -1, 0], "B": [1, 1, 0]}.items():
+            with self.subTest(axis=axis):
+                printer = FakePrinter()
+                _, plugin = load_plugin(printer)
+                plugin.cmd_excite(FakeGCmd(AXIS=axis, FREQUENCY=40, DURATION=1, RECORD=0, OUTPUT_DIR=tempfile.gettempdir()))
+                self.assertEqual(printer.resonance_tester.moves[0][1]["direction_vector"], vector)
+
+    def test_static_frequency_unsafe_refusal_before_motion(self) -> None:
+        printer = FakePrinter()
+        printer.printing = True
+        module, plugin = load_plugin(printer)
+        with self.assertRaisesRegex(module.CommandError, "printing"):
+            plugin.cmd_excite(FakeGCmd(AXIS="X", FREQUENCY=40, DURATION=1, OUTPUT_DIR=tempfile.gettempdir()))
+        self.assertEqual(printer.resonance_tester.moves, [])
+
+    def test_static_frequency_success_with_and_without_recording(self) -> None:
+        printer = FakePrinter()
+        _, plugin = load_plugin(printer)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            no_record = FakeGCmd(AXIS="X", FREQUENCY=40, DURATION=1, RECORD=0, OUTPUT_DIR=temp_dir)
+            plugin.cmd_excite(no_record)
+            self.assertIn("excitation complete", no_record.responses[0])
+            self.assertNotIn("path=", no_record.responses[0])
+            self.assertEqual(list(Path(temp_dir).glob("*.sbcapture.json")), [])
+
+            record = FakeGCmd(AXIS="A", FREQUENCY=45, DURATION=1, RECORD=1, OUTPUT_DIR=temp_dir)
+            plugin.cmd_excite(record)
+            captures = list(Path(temp_dir).glob("*.sbcapture.json"))
+            self.assertEqual(len(captures), 1)
+            data = json.loads(captures[0].read_text())
+        self.assertEqual(data["tool"], "static-frequency")
+        self.assertEqual(data["command"], "SHAKEANDBAKE_EXCITE")
+        self.assertEqual(data["measurements"][0]["metadata"]["axis_label"], "A")
+        self.assertEqual(data["measurements"][0]["metadata"]["direction_vector"], [1, -1, 0])
+        self.assertEqual(data["measurements"][0]["metadata"]["frequency"], 45.0)
+        self.assertTrue(printer.input_shaper.state["enabled"])
+        self.assertEqual(printer.toolhead.velocity_limits["max_velocity"], 600.0)
+
+    def test_static_frequency_forced_failures_restore_state(self) -> None:
+        for failure in ["motion", "sampling", "writing"]:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp_dir:
+                printer = FakePrinter()
+                module, plugin = load_plugin(printer)
+                if failure == "motion":
+                    printer.resonance_tester.fail = True
+                if failure == "sampling":
+                    printer.lis2dw.fail = True
+                patcher = mock.patch.object(module, "write_capture_artifact", side_effect=RuntimeError("write failure"))
+                context = patcher if failure == "writing" else _null_context()
+                with context:
+                    with self.assertRaises(Exception):
+                        plugin.cmd_excite(FakeGCmd(AXIS="X", FREQUENCY=40, DURATION=1, RECORD=1, OUTPUT_DIR=temp_dir))
                 self.assertTrue(printer.input_shaper.state["enabled"])
                 self.assertEqual(printer.toolhead.velocity_limits["max_velocity"], 600.0)
                 self.assertGreaterEqual(printer.input_shaper.restores, 1)

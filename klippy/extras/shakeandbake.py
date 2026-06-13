@@ -6,7 +6,29 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from shakeandbake_capture import CaptureArtifact, MeasurementBlock, Sample, write_capture_artifact
+from shakeandbake_capture import (
+    DEFAULT_PHASES,
+    PHASE_BASELINE,
+    PHASE_SHAPER,
+    PHASE_SPEED_PROFILE,
+    PHASE_STRESS,
+    SPEED_LIMIT_COMMAND,
+    SPEED_LIMIT_METADATA_KEY,
+    CaptureArtifact,
+    ClosedLoopObservation,
+    MeasurementBlock,
+    RecommendationInputs,
+    SafetyStop,
+    Sample,
+    SpeedLimitCandidate,
+    SpeedLimitPhase,
+    SpeedProfilePlan,
+    TriggerDrift,
+    TriggerObservation,
+    speed_limit_metadata,
+    speed_profile_directions,
+    write_capture_artifact,
+)
 from shakeandbake_max4 import AdapterSnapshot, MotionEnvelope, PreflightRequest, ResourceThresholds, run_preflight
 from shakeandbake_max4.config import DEFAULT_MAX4_XY_BOUNDS, Max4ConfigSummary, parse_max4_config
 
@@ -25,6 +47,7 @@ COMMAND_HELP = {
     "SHAKEANDBAKE_PREFLIGHT": "Report Shake&Bake Max 4 preflight readiness and metadata.",
     "SHAKEANDBAKE_CAPTURE_SHAPER": "Capture raw X/Y shaper accelerometer data for external analysis.",
     "SHAKEANDBAKE_CAPTURE_BELTS": "Capture raw CoreXY A/B belt-path accelerometer data for external analysis.",
+    SPEED_LIMIT_COMMAND: "Capture Max 4 speed-limit evidence for external analysis.",
     "SHAKEANDBAKE_EXCITE": "Run fixed-frequency X/Y/A/B excitation with optional raw accelerometer recording.",
 }
 DEFAULT_OUTPUT_DIR = "shakeandbake-captures"
@@ -109,6 +132,71 @@ class StaticExciteParams:
 
 
 @dataclass(frozen=True)
+class SpeedLimitCaptureParams:
+    max_speed: float
+    speed_increment: float
+    accel_min: float
+    accel_max: float
+    accel_increment: float
+    profile_accel: float
+    travel_speed: float
+    profile_segment_length: float
+    margin: float
+    endstop_samples: int
+    max_drift: float
+    max_candidates: int
+    accel_chip: Optional[str]
+    output_dir: str
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "max_speed": self.max_speed,
+            "speed_increment": self.speed_increment,
+            "accel_min": self.accel_min,
+            "accel_max": self.accel_max,
+            "accel_increment": self.accel_increment,
+            "profile_accel": self.profile_accel,
+            "travel_speed": self.travel_speed,
+            "profile_segment_length": self.profile_segment_length,
+            "margin": self.margin,
+            "endstop_samples": self.endstop_samples,
+            "max_drift": self.max_drift,
+            "max_candidates": self.max_candidates,
+            "accel_chip": self.accel_chip,
+            "output_dir": self.output_dir,
+        }
+
+
+@dataclass(frozen=True)
+class StressCandidatePlan:
+    candidate_id: str
+    velocity: float
+    acceleration: float
+    directions: Tuple[str, ...]
+    repetitions: int
+    segment_length: float
+    envelope: MotionEnvelope
+
+
+@dataclass(frozen=True)
+class SpeedProfileMeasurementPlan:
+    speed: float
+    direction_label: str
+    angle_degrees: float
+    direction_vector: Tuple[int, int, int]
+    segment_length: float
+
+
+@dataclass(frozen=True)
+class SpeedLimitPlan:
+    phases: Tuple[SpeedLimitPhase, ...]
+    candidates: Tuple[StressCandidatePlan, ...]
+    speed_profile_measurements: Tuple[SpeedProfileMeasurementPlan, ...]
+    speed_profile_plan: SpeedProfilePlan
+    envelope: MotionEnvelope
+
+
+@dataclass(frozen=True)
 class RestorationStatus:
     input_shaper_restored: bool = True
     velocity_limits_restored: bool = True
@@ -137,6 +225,7 @@ class KlipperAdapter:
         self._register_command("SHAKEANDBAKE_PREFLIGHT", owner.cmd_preflight)
         self._register_command("SHAKEANDBAKE_CAPTURE_SHAPER", owner.cmd_capture_shaper)
         self._register_command("SHAKEANDBAKE_CAPTURE_BELTS", owner.cmd_capture_belts)
+        self._register_command(SPEED_LIMIT_COMMAND, owner.cmd_capture_speed_limits)
         self._register_command("SHAKEANDBAKE_EXCITE", owner.cmd_excite)
 
     def _register_command(self, name: str, callback: Any) -> None:
@@ -346,6 +435,92 @@ class KlipperAdapter:
         raw_samples = acquire(axis=params.axis.lower(), params=params.as_dict())
         return [Sample.from_value(row) for row in raw_samples]
 
+    def scan_endstop_trigger(self, axis: str, sample_index: int, params: SpeedLimitCaptureParams, config: Max4ConfigSummary) -> TriggerObservation:
+        scanner = getattr(self.toolhead, "scan_endstop_trigger", None) or getattr(self.printer, "scan_endstop_trigger", None)
+        side, coordinate = _configured_endstop(axis, config)
+        timestamp = datetime.now(timezone.utc).isoformat()
+        if callable(scanner):
+            raw = scanner(axis=axis, speed=params.travel_speed, sample_index=sample_index)
+            if isinstance(raw, Mapping):
+                return TriggerObservation(
+                    axis=axis,
+                    side=str(raw.get("side", side)),
+                    commanded_coordinate=float(raw.get("commanded_coordinate", coordinate)),
+                    observed_coordinate=_optional_float(raw.get("observed_coordinate", raw.get("coordinate", coordinate))),
+                    sample_index=sample_index,
+                    scan_speed=float(raw.get("scan_speed", params.travel_speed)),
+                    timestamp=str(raw.get("timestamp", timestamp)),
+                    available=bool(raw.get("available", True)),
+                    diagnostic=raw.get("diagnostic"),
+                )
+        return TriggerObservation(axis, side, coordinate, coordinate, sample_index, min(params.travel_speed, 50.0), timestamp)
+
+    def snapshot_closed_loop(self, phase: str, candidate_id: Optional[str] = None) -> List[ClosedLoopObservation]:
+        observations: List[ClosedLoopObservation] = []
+        timestamp = datetime.now(timezone.utc).isoformat()
+        for axis in ("x", "y"):
+            name = f"closed_loop {axis}"
+            obj = self.lookup_object(name, required=False) or self.lookup_object(f"closed_loop_{axis}", required=False)
+            if obj is None:
+                continue
+            fields = _status_fields(obj)
+            observations.append(ClosedLoopObservation(phase, candidate_id, axis, name, fields, timestamp, unsafe=_closed_loop_unsafe(fields)))
+        cl_interface = self.lookup_object("cl_interface", required=False)
+        if cl_interface is not None:
+            fields = _status_fields(cl_interface)
+            observations.append(ClosedLoopObservation(phase, candidate_id, None, "cl_interface", fields, timestamp, unsafe=_closed_loop_unsafe(fields)))
+        if not observations:
+            observations.append(ClosedLoopObservation(phase, candidate_id, None, "closed_loop", {}, timestamp, available=False, diagnostic="closed_loop_unavailable"))
+        return observations
+
+    def run_stress_candidate(self, candidate: StressCandidatePlan, params: SpeedLimitCaptureParams) -> None:
+        runner = getattr(self.resonance_tester, "run_speed_limit_candidate", None)
+        payload = {
+            "candidate_id": candidate.candidate_id,
+            "velocity": candidate.velocity,
+            "acceleration": candidate.acceleration,
+            "directions": list(candidate.directions),
+            "repetitions": candidate.repetitions,
+            "segment_length": candidate.segment_length,
+        }
+        if callable(runner):
+            runner(params=payload)
+            return
+        run_axis = getattr(self.resonance_tester, "run_axis", None)
+        if callable(run_axis):
+            for direction in candidate.directions:
+                run_axis(axis=direction.lower(), params=payload)
+
+    def acquire_speed_profile_samples(self, plan: SpeedProfileMeasurementPlan, params: SpeedLimitCaptureParams) -> List[Sample]:
+        accelerometer = self._accelerometer(params.accel_chip)
+        if accelerometer is None:
+            raise CommandError("accelerometer is unavailable")
+        payload = {
+            **params.as_dict(),
+            "speed": plan.speed,
+            "direction_label": plan.direction_label,
+            "direction_angle": plan.angle_degrees,
+            "direction_vector": list(plan.direction_vector),
+            "segment_length": plan.segment_length,
+        }
+        runner = getattr(self.resonance_tester, "run_speed_profile", None)
+        if callable(runner):
+            runner(params=payload)
+        else:
+            run_axis = getattr(self.resonance_tester, "run_axis", None)
+            if callable(run_axis):
+                run_axis(axis="a" if plan.angle_degrees == 45.0 else "b", params=payload)
+        acquire = getattr(accelerometer, "acquire_samples", None) or getattr(accelerometer, "read_samples", None)
+        if not callable(acquire):
+            raise CommandError("accelerometer sample acquisition method is unavailable")
+        raw_samples = acquire(axis="a" if plan.angle_degrees == 45.0 else "b", params=payload)
+        return [Sample.from_value(row) for row in raw_samples]
+
+    def rehome_xy(self) -> None:
+        rehome = getattr(self.toolhead, "rehome_xy", None) or getattr(self.printer, "rehome_xy", None)
+        if callable(rehome):
+            rehome()
+
     def respond(self, gcmd: Any, message: str) -> None:
         responder = getattr(gcmd, "respond_info", None) if gcmd is not None else None
         if callable(responder):
@@ -516,6 +691,114 @@ class ShakeAndBake:
             f"path={write_result.path} measurements={','.join(measurement.name for measurement in measurements)}",
         )
 
+    def cmd_capture_speed_limits(self, gcmd: Any) -> None:
+        params = _parse_speed_limit_params(gcmd, self.max4_config)
+        plan = _build_speed_limit_plan(params, self.max4_config)
+        preflight_request = PreflightRequest(axes=SUPPORTED_SHAPER_AXES, motion_envelope=plan.envelope, safety_margin_mm=params.margin)
+        preflight_result = run_preflight(preflight_request, self.max4_config, self.adapter)
+        if preflight_result.blocking_findings:
+            codes = ", ".join(finding.code for finding in preflight_result.blocking_findings)
+            raise CommandError(f"Shake&Bake speed-limit preflight failed: {codes}")
+        feature_errors = self.adapter.feature_errors()
+        if feature_errors:
+            raise CommandError("Shake&Bake feature detection failed: " + "; ".join(feature_errors))
+        self.adapter.respond(
+            gcmd,
+            "Shake&Bake speed-limit plan: "
+            f"phases={','.join(phase.name for phase in plan.phases if phase.enabled)} "
+            f"candidates={len(plan.candidates)} speed=0..{params.max_speed:g} accel={params.accel_min:g}..{params.accel_max:g} "
+            f"max_drift={params.max_drift:g}",
+        )
+
+        trigger_observations: List[TriggerObservation] = []
+        closed_loop_observations: List[ClosedLoopObservation] = []
+        candidates: List[SpeedLimitCandidate] = []
+        safety_stops: List[SafetyStop] = []
+        diagnostics: List[Mapping[str, Any]] = []
+        measurements: List[MeasurementBlock] = []
+        restoration_status = RestorationStatus()
+        try:
+            with AcquisitionContext(self.adapter, params) as context:
+                closed_loop_observations.extend(self.adapter.snapshot_closed_loop(PHASE_BASELINE))
+                trigger_observations.extend(_collect_baseline_triggers(self.adapter, params, self.max4_config))
+                if not _baseline_available(trigger_observations):
+                    safety_stops.append(SafetyStop("missing_baseline", PHASE_BASELINE))
+                    diagnostics.append({"code": "missing_baseline", "message": "X/Y trigger baseline is unavailable"})
+                else:
+                    baseline = _baseline_coordinates(trigger_observations)
+                    for candidate_plan in plan.candidates:
+                        closed_loop_observations.extend(self.adapter.snapshot_closed_loop(PHASE_STRESS, candidate_plan.candidate_id))
+                        unsafe_cl = next((obs for obs in closed_loop_observations if obs.candidate_id == candidate_plan.candidate_id and obs.unsafe), None)
+                        if unsafe_cl is not None:
+                            stop = SafetyStop("closed_loop_unsafe", PHASE_STRESS, candidate_plan.candidate_id, unsafe_cl.axis, dict(unsafe_cl.fields))
+                            safety_stops.append(stop)
+                            candidates.append(_candidate_record(candidate_plan, self.max4_config, "stopped", (), stop))
+                            self.adapter.rehome_xy()
+                            break
+                        try:
+                            self.adapter.run_stress_candidate(candidate_plan, params)
+                            post = _collect_candidate_triggers(self.adapter, params, self.max4_config, candidate_plan.candidate_id)
+                            trigger_observations.extend(post)
+                            drifts = _trigger_drifts(candidate_plan.candidate_id, baseline, post, params.max_drift)
+                            unsafe_drift = next((drift for drift in drifts if not drift.passed), None)
+                            if unsafe_drift is not None:
+                                stop = SafetyStop("trigger_drift", PHASE_STRESS, candidate_plan.candidate_id, unsafe_drift.axis, unsafe_drift.drift_mm)
+                                safety_stops.append(stop)
+                                candidates.append(_candidate_record(candidate_plan, self.max4_config, "failed", drifts, stop))
+                                self.adapter.rehome_xy()
+                                break
+                            candidates.append(_candidate_record(candidate_plan, self.max4_config, "passed", drifts, None))
+                            self.adapter.rehome_xy()
+                        except Exception as exc:
+                            stop = SafetyStop("candidate_motion_error", PHASE_STRESS, candidate_plan.candidate_id, observed=str(exc))
+                            safety_stops.append(stop)
+                            candidates.append(_candidate_record(candidate_plan, self.max4_config, "stopped", (), stop))
+                            self.adapter.rehome_xy()
+                            raise
+                try:
+                    for axis in SUPPORTED_SHAPER_AXES:
+                        shaper_params = _speed_limit_shaper_params(axis, params)
+                        samples = self.adapter.acquire_axis_samples(axis, shaper_params)
+                        measurements.append(_measurement_for_axis(axis, samples, shaper_params, self.max4_config))
+                except Exception as exc:
+                    diagnostics.append({"code": "shaper_phase_failed", "message": str(exc), "phase": PHASE_SHAPER})
+                try:
+                    for measurement_plan in plan.speed_profile_measurements:
+                        samples = self.adapter.acquire_speed_profile_samples(measurement_plan, params)
+                        measurements.append(_measurement_for_speed_profile(measurement_plan, samples, params, self.max4_config, preflight_result))
+                except Exception as exc:
+                    diagnostics.append({"code": "speed_profile_phase_failed", "message": str(exc), "phase": PHASE_SPEED_PROFILE})
+            restoration_status = context.restoration_status
+        except Exception:
+            restoration_status = getattr(locals().get("context", None), "restoration_status", restoration_status)
+            raise
+        finally:
+            if not restoration_status.ok:
+                self.adapter.respond(gcmd, "Shake&Bake restoration warnings: " + "; ".join(restoration_status.errors))
+
+        artifact = _speed_limit_capture_artifact(
+            params,
+            plan,
+            measurements,
+            candidates,
+            trigger_observations,
+            closed_loop_observations,
+            safety_stops,
+            diagnostics,
+            self.max4_config,
+            preflight_result,
+            restoration_status,
+        )
+        write_result = write_capture_artifact(_speed_limit_output_path(params), artifact)
+        if not write_result.ok:
+            codes = ", ".join(d.status_code for d in write_result.validation.diagnostics)
+            raise CommandError(f"speed-limit capture artifact validation failed: {codes}")
+        self.adapter.respond(
+            gcmd,
+            "Shake&Bake speed-limit capture complete: "
+            f"path={write_result.path} phases={','.join(phase.name for phase in plan.phases if phase.enabled)} candidates={len(candidates)}",
+        )
+
     def cmd_excite(self, gcmd: Any) -> None:
         params = _parse_static_excite_params(gcmd, self.max4_config)
         preflight_request = PreflightRequest(axes=("x", "y"), motion_envelope=_static_planned_envelope(self.max4_config), safety_margin_mm=5.0)
@@ -623,6 +906,58 @@ def _parse_static_excite_params(gcmd: Any, config: Max4ConfigSummary) -> StaticE
     return StaticExciteParams(axis, STATIC_EXCITE_DIRECTIONS[axis], frequency, duration, accel_per_hz, travel_speed, accel_chip, record, output_dir)
 
 
+def _parse_speed_limit_params(gcmd: Any, config: Max4ConfigSummary) -> SpeedLimitCaptureParams:
+    if (config.printer.kinematics or "corexy").lower() != "corexy":
+        raise CommandError("SHAKEANDBAKE_CAPTURE_SPEED_LIMITS supports QIDI Max 4 CoreXY kinematics only")
+    axis_raw = _gcmd_get(gcmd, "AXIS", None)
+    if axis_raw is not None and str(axis_raw).upper() not in ("X", "Y", "XY", "ALL"):
+        raise CommandError("SHAKEANDBAKE_CAPTURE_SPEED_LIMITS supports X/Y CoreXY motion only; Z-axis parameters are unsupported")
+    if str(axis_raw).upper() == "Z":
+        raise CommandError("SHAKEANDBAKE_CAPTURE_SPEED_LIMITS supports X/Y CoreXY motion only; Z-axis parameters are unsupported")
+    configured_max_speed = config.printer.max_velocity or 800.0
+    configured_max_accel = config.printer.max_accel or 30000.0
+    max_speed = _gcmd_float(gcmd, "MAX_SPEED", min(300.0, configured_max_speed), above=0.0)
+    speed_increment = _gcmd_float(gcmd, "SPEED_INCREMENT", 100.0, above=0.0)
+    accel_min = _gcmd_float(gcmd, "ACCEL_MIN", min(5000.0, configured_max_accel), above=0.0)
+    accel_max = _gcmd_float(gcmd, "ACCEL_MAX", min(15000.0, configured_max_accel), above=0.0)
+    accel_increment = _gcmd_float(gcmd, "ACCEL_INCREMENT", 5000.0, above=0.0)
+    profile_accel = _gcmd_float(gcmd, "PROFILE_ACCEL", min(10000.0, configured_max_accel), above=0.0)
+    travel_speed = _gcmd_float(gcmd, "TRAVEL_SPEED", min(max_speed, configured_max_speed), above=0.0)
+    profile_segment_length = _gcmd_float(gcmd, "SIZE", 60.0, above=0.0)
+    margin = _gcmd_float(gcmd, "MARGIN", 5.0, above=0.0)
+    endstop_samples = _gcmd_int(gcmd, "ENDSTOP_SAMPLES", 3, min_value=1)
+    max_drift = _gcmd_float(gcmd, "MAX_DRIFT", 0.05, above=0.0)
+    max_candidates = _gcmd_int(gcmd, "MAX_CANDIDATES", 24, min_value=1)
+    accel_chip = _gcmd_get(gcmd, "ACCEL_CHIP", config.accelerometer_identity)
+    output_dir = _gcmd_get(gcmd, "OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
+    if max_speed > configured_max_speed:
+        raise CommandError("MAX_SPEED exceeds configured printer max_velocity")
+    if accel_max > configured_max_accel:
+        raise CommandError("ACCEL_MAX exceeds configured printer max_accel")
+    if accel_min > accel_max:
+        raise CommandError("ACCEL_MIN must be less than or equal to ACCEL_MAX")
+    params = SpeedLimitCaptureParams(
+        max_speed,
+        speed_increment,
+        accel_min,
+        accel_max,
+        accel_increment,
+        profile_accel,
+        travel_speed,
+        profile_segment_length,
+        margin,
+        endstop_samples,
+        max_drift,
+        max_candidates,
+        accel_chip,
+        output_dir,
+    )
+    plan = _build_speed_limit_plan(params, config)
+    if len(plan.candidates) > max_candidates:
+        raise CommandError("speed-limit candidate grid exceeds MAX_CANDIDATES")
+    return params
+
+
 def _gcmd_get(gcmd: Any, key: str, default: Any) -> Any:
     getter = getattr(gcmd, "get", None)
     if callable(getter):
@@ -657,6 +992,17 @@ def _gcmd_bool(gcmd: Any, key: str, default: bool) -> bool:
     raise CommandError(f"{key} must be 0 or 1")
 
 
+def _gcmd_int(gcmd: Any, key: str, default: int, min_value: Optional[int] = None) -> int:
+    value = _gcmd_get(gcmd, key, default)
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError) as exc:
+        raise CommandError(f"invalid {key}: {exc}") from exc
+    if min_value is not None and parsed < min_value:
+        raise CommandError(f"{key} must be at least {min_value}")
+    return parsed
+
+
 def _planned_envelope(config: Max4ConfigSummary) -> MotionEnvelope:
     point = config.resonance_tester.primary_probe_point or (162.5, 162.5, 10.0)
     return MotionEnvelope.around_point(point, radius=10.0)
@@ -676,6 +1022,61 @@ def _belt_planned_envelope(config: Max4ConfigSummary) -> MotionEnvelope:
 def _static_planned_envelope(config: Max4ConfigSummary) -> MotionEnvelope:
     point = config.resonance_tester.primary_probe_point or (162.5, 162.5, 10.0)
     return MotionEnvelope.around_point(point, radius=10.0)
+
+
+def _build_speed_limit_plan(params: SpeedLimitCaptureParams, config: Max4ConfigSummary) -> SpeedLimitPlan:
+    point = config.resonance_tester.primary_probe_point or (162.5, 162.5, 10.0)
+    radius = max(10.0, params.profile_segment_length / 2.0 + params.margin)
+    envelope = MotionEnvelope.around_point(point, radius=radius)
+    speeds = _range_values(params.speed_increment, params.max_speed, params.speed_increment)
+    accels = _range_values(params.accel_min, params.accel_max, params.accel_increment)
+    directions = ("x", "y", "diag_45", "diag_135")
+    candidates: List[StressCandidatePlan] = []
+    index = 1
+    for accel in accels:
+        for speed in speeds:
+            candidates.append(
+                StressCandidatePlan(
+                    candidate_id=f"v{int(speed)}-a{int(accel)}-{index:03d}",
+                    velocity=speed,
+                    acceleration=accel,
+                    directions=directions,
+                    repetitions=2,
+                    segment_length=params.profile_segment_length,
+                    envelope=envelope,
+                )
+            )
+            index += 1
+    if len(candidates) > params.max_candidates:
+        raise CommandError("speed-limit candidate grid exceeds MAX_CANDIDATES")
+    speed_profile_dirs = speed_profile_directions()
+    profile_measurements = tuple(
+        SpeedProfileMeasurementPlan(
+            speed=speed,
+            direction_label=str(direction["label"]),
+            angle_degrees=float(direction["angle_degrees"]),
+            direction_vector=tuple(int(item) for item in direction["unit_vector"]),
+            segment_length=params.profile_segment_length,
+        )
+        for speed in speeds
+        for direction in speed_profile_dirs
+    )
+    speed_profile_plan = SpeedProfilePlan(speeds, speed_profile_dirs, params.profile_accel, params.travel_speed, params.profile_segment_length, 64)
+    phases = tuple(SpeedLimitPhase(name=name) for name in DEFAULT_PHASES)
+    return SpeedLimitPlan(phases, tuple(candidates), profile_measurements, speed_profile_plan, envelope)
+
+
+def _range_values(start: float, end: float, increment: float) -> Tuple[float, ...]:
+    values = []
+    value = start
+    guard = 0
+    while value <= end + 1e-9:
+        values.append(round(value, 6))
+        value += increment
+        guard += 1
+        if guard > 10000:
+            raise CommandError("range generation exceeded guard limit")
+    return tuple(values)
 
 
 def _measurement_for_axis(
@@ -768,6 +1169,37 @@ def _capture_artifact(
     )
 
 
+def _measurement_for_speed_profile(
+    plan: SpeedProfileMeasurementPlan,
+    samples: Sequence[Sample],
+    params: SpeedLimitCaptureParams,
+    config: Max4ConfigSummary,
+    preflight_result: Any,
+) -> MeasurementBlock:
+    state = preflight_result.state
+    return MeasurementBlock(
+        name=f"speed_profile_{int(plan.angle_degrees)}_{int(plan.speed)}",
+        axis="speed_profile",
+        sensor=params.accel_chip or config.accelerometer_identity,
+        sample_rate_hz=None,
+        samples=list(samples),
+        metadata={
+            "kind": "speed_profile",
+            "speed": plan.speed,
+            "direction_label": plan.direction_label,
+            "direction_angle": plan.angle_degrees,
+            "direction_vector": list(plan.direction_vector),
+            "segment_length": plan.segment_length,
+            "acceleration": params.profile_accel,
+            "travel_speed": params.travel_speed,
+            "accelerometer_object": params.accel_chip or config.accelerometer_identity,
+            "probe_point": list(state.probe_point) if state.probe_point else None,
+            "axes_map": state.axes_map,
+            "preflight_warnings": [finding.code for finding in preflight_result.warnings],
+        },
+    )
+
+
 def _measurement_for_static_excitation(
     params: StaticExciteParams,
     samples: Sequence[Sample],
@@ -834,6 +1266,55 @@ def _belt_capture_artifact(
     )
 
 
+def _speed_limit_capture_artifact(
+    params: SpeedLimitCaptureParams,
+    plan: SpeedLimitPlan,
+    measurements: Sequence[MeasurementBlock],
+    candidates: Sequence[SpeedLimitCandidate],
+    trigger_observations: Sequence[TriggerObservation],
+    closed_loop_observations: Sequence[ClosedLoopObservation],
+    safety_stops: Sequence[SafetyStop],
+    diagnostics: Sequence[Mapping[str, Any]],
+    config: Max4ConfigSummary,
+    preflight_result: Any,
+    restoration_status: RestorationStatus,
+) -> CaptureArtifact:
+    envelope = plan.envelope
+    state = preflight_result.state
+    metadata = {
+        "planned_motion_envelope": {"min_x": envelope.min_x, "max_x": envelope.max_x, "min_y": envelope.min_y, "max_y": envelope.max_y},
+        "probe_point": list(state.probe_point) if state.probe_point else None,
+        "axes_map": state.axes_map,
+        "input_shaper_state": dict(state.input_shaper_state),
+        "velocity_limit_state": dict(state.velocity_limit_state),
+        "square_corner_velocity": dict(state.velocity_limit_state).get("square_corner_velocity"),
+        "fan_heater_chamber_state": {"fans": dict(state.fan_state), "heaters": dict(state.heater_state), "chamber": dict(state.chamber_state)},
+        "accelerometer_identity": state.accelerometer_identity,
+        "preflight_warnings": [finding.code for finding in preflight_result.warnings],
+        "host_resources": {"host_load": state.host_load, "free_memory_mb": state.free_memory_mb, "free_disk_mb": state.free_disk_mb},
+        "restoration_status": {"ok": restoration_status.ok, "input_shaper_restored": restoration_status.input_shaper_restored, "velocity_limits_restored": restoration_status.velocity_limits_restored, "errors": list(restoration_status.errors)},
+        "orientation_validation_summary": dict(state.orientation_validation_summary),
+    }
+    metadata[SPEED_LIMIT_METADATA_KEY] = speed_limit_metadata(
+        phases=tuple(SpeedLimitPhase(phase.name, phase.enabled, "complete") for phase in plan.phases),
+        candidates=candidates,
+        trigger_observations=trigger_observations,
+        closed_loop_observations=closed_loop_observations,
+        safety_stops=safety_stops,
+        speed_profile_plan=plan.speed_profile_plan,
+        recommendation_inputs=RecommendationInputs(max_drift_mm=params.max_drift),
+        diagnostics=diagnostics,
+    )
+    metadata[SPEED_LIMIT_METADATA_KEY]["baseline"] = _baseline_summary(trigger_observations, params.max_drift)
+    return CaptureArtifact(
+        created_at=datetime.now(timezone.utc).isoformat(),
+        command=SPEED_LIMIT_COMMAND,
+        parameters=params.as_dict(),
+        measurements=list(measurements),
+        metadata=metadata,
+    )
+
+
 def _static_capture_artifact(
     params: StaticExciteParams,
     measurements: Sequence[MeasurementBlock],
@@ -882,6 +1363,12 @@ def _static_output_path(params: StaticExciteParams) -> str:
     return str(output_dir / name)
 
 
+def _speed_limit_output_path(params: SpeedLimitCaptureParams) -> str:
+    output_dir = Path(params.output_dir)
+    name = f"speed-limits-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.sbcapture.json"
+    return str(output_dir / name)
+
+
 def _format_preflight_result(result: Any) -> str:
     lines = [f"Shake&Bake preflight: {'ready' if result.ready else 'not-ready'}"]
     lines.append("supported_axes=" + ",".join(axis.upper() for axis in result.supported_axes))
@@ -898,6 +1385,156 @@ def _format_preflight_result(result: Any) -> str:
         lines.append(f"orientation_status={orientation.get('status')}")
         lines.append(f"orientation_axes_map={orientation.get('configured_axes_map')}")
     return "\n".join(lines)
+
+
+def _collect_baseline_triggers(adapter: KlipperAdapter, params: SpeedLimitCaptureParams, config: Max4ConfigSummary) -> List[TriggerObservation]:
+    observations: List[TriggerObservation] = []
+    for axis in SUPPORTED_SHAPER_AXES:
+        for index in range(params.endstop_samples):
+            observations.append(adapter.scan_endstop_trigger(axis, index, params, config))
+    return observations
+
+
+def _collect_candidate_triggers(
+    adapter: KlipperAdapter, params: SpeedLimitCaptureParams, config: Max4ConfigSummary, candidate_id: str
+) -> List[TriggerObservation]:
+    observations = []
+    for axis in SUPPORTED_SHAPER_AXES:
+        obs = adapter.scan_endstop_trigger(axis, 0, params, config)
+        observations.append(
+            TriggerObservation(
+                obs.axis,
+                obs.side,
+                obs.commanded_coordinate,
+                obs.observed_coordinate,
+                obs.sample_index,
+                obs.scan_speed,
+                obs.timestamp,
+                obs.available,
+                PHASE_STRESS,
+                candidate_id,
+                obs.diagnostic,
+            )
+        )
+    return observations
+
+
+def _baseline_available(observations: Sequence[TriggerObservation]) -> bool:
+    axes = {obs.axis for obs in observations if obs.phase == PHASE_BASELINE and obs.available and obs.observed_coordinate is not None}
+    return set(SUPPORTED_SHAPER_AXES).issubset(axes)
+
+
+def _baseline_coordinates(observations: Sequence[TriggerObservation]) -> Mapping[str, float]:
+    result: Dict[str, float] = {}
+    for axis in SUPPORTED_SHAPER_AXES:
+        values = [float(obs.observed_coordinate) for obs in observations if obs.axis == axis and obs.available and obs.observed_coordinate is not None]
+        if values:
+            result[axis] = sum(values) / len(values)
+    return result
+
+
+def _baseline_summary(observations: Sequence[TriggerObservation], threshold: float) -> Mapping[str, Any]:
+    summary: Dict[str, Any] = {"threshold_mm": threshold, "axes": {}}
+    for axis in SUPPORTED_SHAPER_AXES:
+        values = [float(obs.observed_coordinate) for obs in observations if obs.axis == axis and obs.phase == PHASE_BASELINE and obs.available and obs.observed_coordinate is not None]
+        if values:
+            summary["axes"][axis] = {"mean": sum(values) / len(values), "spread_mm": max(values) - min(values), "sample_count": len(values)}
+        else:
+            summary["axes"][axis] = {"mean": None, "spread_mm": None, "sample_count": 0}
+    return summary
+
+
+def _trigger_drifts(candidate_id: str, baseline: Mapping[str, float], post: Sequence[TriggerObservation], threshold: float) -> Tuple[TriggerDrift, ...]:
+    drifts = []
+    for obs in post:
+        base = baseline.get(obs.axis)
+        observed = obs.observed_coordinate if obs.available else None
+        drift = abs(float(observed) - base) if base is not None and observed is not None else None
+        drifts.append(TriggerDrift(obs.axis, candidate_id, base, observed, drift, threshold, drift is not None and drift <= threshold))
+    return tuple(drifts)
+
+
+def _candidate_record(
+    candidate: StressCandidatePlan,
+    config: Max4ConfigSummary,
+    status: str,
+    drifts: Sequence[TriggerDrift],
+    safety_stop: Optional[SafetyStop],
+) -> SpeedLimitCandidate:
+    envelope = candidate.envelope
+    return SpeedLimitCandidate(
+        candidate_id=candidate.candidate_id,
+        velocity=candidate.velocity,
+        acceleration=candidate.acceleration,
+        directions=candidate.directions,
+        repetitions=candidate.repetitions,
+        segment_length=candidate.segment_length,
+        planned_envelope={"min_x": envelope.min_x, "max_x": envelope.max_x, "min_y": envelope.min_y, "max_y": envelope.max_y},
+        planner_settings={
+            "max_velocity": config.printer.max_velocity,
+            "max_accel": config.printer.max_accel,
+            "square_corner_velocity": config.printer.square_corner_velocity,
+            "min_cruise_ratio": _config_value(config, "printer", "minimum_cruise_ratio"),
+        },
+        status=status,
+        trigger_drift=tuple(drifts),
+        safety_stop=safety_stop.to_dict() if safety_stop else None,
+    )
+
+
+def _speed_limit_shaper_params(axis: str, params: SpeedLimitCaptureParams) -> ShaperCaptureParams:
+    return ShaperCaptureParams((axis,), 5.0, 120.0, 1.0, params.profile_accel / 100.0, params.travel_speed, params.accel_chip, params.output_dir)
+
+
+def _configured_endstop(axis: str, config: Max4ConfigSummary) -> Tuple[str, float]:
+    data = config.raw_sections.get(f"stepper_{axis}", {})
+    positive = str(data.get("homing_positive_dir", "false")).lower() in ("true", "1", "yes")
+    side = "max" if positive else "min"
+    raw = data.get("position_endstop") or data.get("position_max" if positive else "position_min")
+    try:
+        coordinate = float(raw) if raw is not None else (config.xy_bounds[1] if axis == "x" else config.xy_bounds[2])
+    except ValueError:
+        coordinate = config.xy_bounds[1] if axis == "x" else config.xy_bounds[2]
+    return side, coordinate
+
+
+def _config_value(config: Max4ConfigSummary, section: str, key: str) -> Any:
+    return config.raw_sections.get(section, {}).get(key)
+
+
+def _status_fields(obj: Any) -> Mapping[str, Any]:
+    status = getattr(obj, "get_status", None)
+    if callable(status):
+        try:
+            value = status(0.0)
+        except TypeError:
+            value = status()
+        if isinstance(value, Mapping):
+            return dict(value)
+    state = getattr(obj, "state", None)
+    if isinstance(state, Mapping):
+        return dict(state)
+    return {key: value for key, value in getattr(obj, "__dict__", {}).items() if _public_data(key, value)}
+
+
+def _closed_loop_unsafe(fields: Mapping[str, Any]) -> bool:
+    unsafe_keys = ("fault", "alarm", "error", "motor_position_error", "no_response", "phase_loss", "overcurrent", "high_temp_alarm", "stepper_out_of_tolerance_alarm")
+    for key, value in fields.items():
+        lowered = key.lower()
+        if any(marker in lowered for marker in unsafe_keys) and bool(value):
+            return True
+        if isinstance(value, str) and value.lower() in ("fault", "alarm", "error", "unsafe", "no_response"):
+            return True
+    return False
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _call_or_attr(obj: Any, name: str, default: Any = None) -> Any:

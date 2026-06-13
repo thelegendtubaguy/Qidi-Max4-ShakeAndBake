@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "tool": "shakeandbake",
+  "printer_model": "qidi_max_4",
+  "created_at": "2026-06-13T00:00:00Z",
+  "command": "SHAKEANDBAKE_CAPTURE AXES=X,Y",
+  "parameters": {
+    "axes": ["x", "y"],
+    "frequency_start_hz": 10,
+    "frequency_end_hz": 120
+  },
+  "metadata": {
+    "planned_motion_envelope": {
+      "axes": ["x", "y"],
+      "min_frequency_hz": 10,
+      "max_frequency_hz": 120,
+      "amplitude_mm": 1.5
+    },
+    "probe_point": [150.0, 150.0, 20.0],
+    "axes_map": {
+      "toolhead_x": "sensor_x",
+      "toolhead_y": "sensor_y",
+      "toolhead_z": "sensor_z"
+    },
+    "input_shaper_state": {
+      "shaper_type_x": "mzv",
+      "shaper_freq_x": 47.4,
+      "shaper_type_y": "ei",
+      "shaper_freq_y": 39.2
+    },
+    "velocity_limit_state": {
+      "max_velocity": 600,
+      "max_accel": 20000,
+      "square_corner_velocity": 5
+    },
+    "fan_heater_chamber_state": {
+      "part_fan": 0.0,
+      "hotend_target_c": 0.0,
+      "bed_target_c": 0.0,
+      "chamber_temp_c": 27.5
+    },
+    "klipper_version": "v0.12.0",
+    "klipper_git_hash": "fixture-klipper-hash",
+    "qidi_firmware_fingerprint": "fixture-fw",
+    "configuration_fingerprint": "fixture-config"
+  },
+  "measurements": [
+    {
+      "name": "x_sweep",
+      "axis": "x",
+      "sensor": "lis2dw",
+      "sample_count": 4,
+      "sample_rate_hz": 1000.0,
+      "columns": ["time", "accel_x", "accel_y", "accel_z"],
+      "units": {
+        "time": "s",
+        "accel_x": "m/s^2",
+        "accel_y": "m/s^2",
+        "accel_z": "m/s^2"
+      },
+      "metadata": {
+        "accelerometer_object": "lis2dw",
+        "sample_rate_estimate_hz": 1000.0
+      },
+      "samples": [
+        [0.000, 0.10, 0.02, 9.80],
+        [0.001, 0.13, 0.03, 9.81],
+        [0.002, 0.09, 0.04, 9.79],
+        [0.003, 0.14, 0.01, 9.82]
+      ]
+    },
+    {
+      "name": "y_sweep",
+      "axis": "y",
+      "sensor": "lis2dw",
+      "sample_count": 4,
+      "columns": ["time", "accel_x", "accel_y", "accel_z"],
+      "metadata": {
+        "accelerometer_object": "lis2dw"
+      },
+      "samples": [
+        [0.000, 0.01, 0.10, 9.80],
+        [0.001, 0.03, 0.14, 9.81],
+        [0.002, 0.02, 0.09, 9.79],
+        [0.003, 0.04, 0.15, 9.82]
+      ]
+    }
+  ]
+}

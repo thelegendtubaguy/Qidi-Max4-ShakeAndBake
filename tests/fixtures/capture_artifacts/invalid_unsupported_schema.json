@@ -1,0 +1,149 @@
+{
+  "command": "SHAKEANDBAKE_CAPTURE AXES=X,Y",
+  "created_at": "2026-06-13T00:00:00Z",
+  "measurements": [
+    {
+      "axis": "x",
+      "columns": [
+        "time",
+        "accel_x",
+        "accel_y",
+        "accel_z"
+      ],
+      "metadata": {
+        "accelerometer_object": "lis2dw",
+        "sample_rate_estimate_hz": 1000.0
+      },
+      "name": "x_sweep",
+      "sample_count": 4,
+      "sample_rate_hz": 1000.0,
+      "samples": [
+        [
+          0.0,
+          0.1,
+          0.02,
+          9.8
+        ],
+        [
+          0.001,
+          0.13,
+          0.03,
+          9.81
+        ],
+        [
+          0.002,
+          0.09,
+          0.04,
+          9.79
+        ],
+        [
+          0.003,
+          0.14,
+          0.01,
+          9.82
+        ]
+      ],
+      "sensor": "lis2dw",
+      "units": {
+        "accel_x": "m/s^2",
+        "accel_y": "m/s^2",
+        "accel_z": "m/s^2",
+        "time": "s"
+      }
+    },
+    {
+      "axis": "y",
+      "columns": [
+        "time",
+        "accel_x",
+        "accel_y",
+        "accel_z"
+      ],
+      "metadata": {
+        "accelerometer_object": "lis2dw"
+      },
+      "name": "y_sweep",
+      "sample_count": 4,
+      "samples": [
+        [
+          0.0,
+          0.01,
+          0.1,
+          9.8
+        ],
+        [
+          0.001,
+          0.03,
+          0.14,
+          9.81
+        ],
+        [
+          0.002,
+          0.02,
+          0.09,
+          9.79
+        ],
+        [
+          0.003,
+          0.04,
+          0.15,
+          9.82
+        ]
+      ],
+      "sensor": "lis2dw"
+    }
+  ],
+  "metadata": {
+    "axes_map": {
+      "toolhead_x": "sensor_x",
+      "toolhead_y": "sensor_y",
+      "toolhead_z": "sensor_z"
+    },
+    "configuration_fingerprint": "fixture-config",
+    "fan_heater_chamber_state": {
+      "bed_target_c": 0.0,
+      "chamber_temp_c": 27.5,
+      "hotend_target_c": 0.0,
+      "part_fan": 0.0
+    },
+    "input_shaper_state": {
+      "shaper_freq_x": 47.4,
+      "shaper_freq_y": 39.2,
+      "shaper_type_x": "mzv",
+      "shaper_type_y": "ei"
+    },
+    "klipper_git_hash": "fixture-klipper-hash",
+    "klipper_version": "v0.12.0",
+    "planned_motion_envelope": {
+      "amplitude_mm": 1.5,
+      "axes": [
+        "x",
+        "y"
+      ],
+      "max_frequency_hz": 120,
+      "min_frequency_hz": 10
+    },
+    "probe_point": [
+      150.0,
+      150.0,
+      20.0
+    ],
+    "qidi_firmware_fingerprint": "fixture-fw",
+    "velocity_limit_state": {
+      "max_accel": 20000,
+      "max_velocity": 600,
+      "square_corner_velocity": 5
+    }
+  },
+  "parameters": {
+    "axes": [
+      "x",
+      "y"
+    ],
+    "frequency_end_hz": 120,
+    "frequency_start_hz": 10
+  },
+  "printer_model": "qidi_max_4",
+  "schema_version": 99,
+  "tool": "shakeandbake"
+}

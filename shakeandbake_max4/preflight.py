@@ -73,6 +73,7 @@ class AdapterSnapshot:
     input_shaper_state: Mapping[str, Any] = field(default_factory=dict)
     velocity_limit_state: Mapping[str, Any] = field(default_factory=dict)
     toolhead_position: Optional[Tuple[float, float, float]] = None
+    orientation_validation_summary: Mapping[str, Any] = field(default_factory=dict)
 
 
 class PreflightAdapter(Protocol):
@@ -94,6 +95,7 @@ class StateSnapshot:
     host_load: Optional[float] = None
     free_memory_mb: Optional[float] = None
     free_disk_mb: Optional[float] = None
+    orientation_validation_summary: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -146,6 +148,7 @@ def run_preflight(
         host_load=adapter_state.host_load,
         free_memory_mb=adapter_state.free_memory_mb,
         free_disk_mb=adapter_state.free_disk_mb,
+        orientation_validation_summary=dict(adapter_state.orientation_validation_summary),
     )
 
     blocking = tuple(finding for finding in findings if finding.severity == BLOCKING)

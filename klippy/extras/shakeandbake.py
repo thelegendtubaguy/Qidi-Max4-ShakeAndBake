@@ -120,6 +120,7 @@ class KlipperAdapter:
             input_shaper_state=self.snapshot_input_shaper(),
             velocity_limit_state=self.snapshot_velocity_limits(),
             toolhead_position=self._toolhead_position(),
+            orientation_validation_summary=self._orientation_validation_summary(),
         )
 
     def printer_ready(self) -> bool:
@@ -195,16 +196,17 @@ class KlipperAdapter:
         keys = ("max_velocity", "max_accel", "square_corner_velocity", "max_z_velocity", "max_z_accel")
         return {key: getattr(obj, key) for key in keys if hasattr(obj, key)}
 
-    def update_velocity_limits(self, params: ShaperCaptureParams) -> None:
+    def update_velocity_limits(self, params: Any) -> None:
         obj = self.toolhead
         if obj is None:
             return
+        travel_speed = getattr(params, "travel_speed", None)
         update = getattr(obj, "update_velocity_limits", None)
         if callable(update):
-            update(max_velocity=params.travel_speed)
+            update(max_velocity=travel_speed) if travel_speed is not None else update()
             return
-        if hasattr(obj, "max_velocity"):
-            setattr(obj, "max_velocity", params.travel_speed)
+        if travel_speed is not None and hasattr(obj, "max_velocity"):
+            setattr(obj, "max_velocity", travel_speed)
 
     def restore_velocity_limits(self, snapshot: Mapping[str, Any]) -> None:
         obj = self.toolhead
@@ -272,6 +274,12 @@ class KlipperAdapter:
         if value is None:
             return None
         return tuple(float(item) for item in value[:3])  # type: ignore[index]
+
+    def _orientation_validation_summary(self) -> Mapping[str, Any]:
+        value = _call_or_attr(self.printer, "orientation_validation_summary", default={})
+        if hasattr(value, "to_dict"):
+            return value.to_dict()
+        return dict(value) if isinstance(value, Mapping) else {}
 
 
 class AcquisitionContext:
@@ -478,6 +486,7 @@ def _capture_artifact(
                 "velocity_limits_restored": restoration_status.velocity_limits_restored,
                 "errors": list(restoration_status.errors),
             },
+            "orientation_validation_summary": dict(state.orientation_validation_summary),
         },
     )
 
@@ -499,6 +508,10 @@ def _format_preflight_result(result: Any) -> str:
         lines.append("blocking=" + ",".join(finding.code for finding in result.blocking_findings))
     if result.warnings:
         lines.append("warnings=" + ",".join(finding.code for finding in result.warnings))
+    if result.state.orientation_validation_summary:
+        orientation = result.state.orientation_validation_summary
+        lines.append(f"orientation_status={orientation.get('status')}")
+        lines.append(f"orientation_axes_map={orientation.get('configured_axes_map')}")
     return "\n".join(lines)
 
 

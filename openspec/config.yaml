@@ -1,20 +1,159 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+context: |
+  Product: Shake&Bake is a QIDI Max 4 data-acquisition and external-analysis tool for resonance, vibration, and motion diagnostics.
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+  Architecture:
+  - Treat the printer as a data-acquisition device.
+  - Keep the Klipper plugin limited to preflight, safe motion control, accelerometer sampling, state restoration, and raw artifact writing.
+  - Run analysis outside Klipper through an external CLI or isolated environment.
+  - Do not install or import NumPy, SciPy, Matplotlib, plotting libraries, or heavy numerical dependencies in Klipper's venv or Klipper process.
+  - Do not mutate `printer.cfg` automatically. Emit proposed config snippets and require explicit operator action.
+  - Keep raw captures immutable. Derived JSON, graph, report, and config-snippet outputs must be separate files referencing the source capture.
+
+  Clean-room boundary:
+  - Implement behavior from requirements, public Klipper behavior, printer measurements, and independently written tests.
+  - Do not copy external GPL implementation files, functions, helper routines, plot layouts, command implementations, macro trampoline text, compressed schemas, strings, or documentation prose.
+  - Use independent command names, file schemas, report layouts, and plotting layouts.
+  - Keep compatibility adapters small, explicit, and tested against QIDI Max 4 firmware behavior.
+  - Add fixtures before tuning numerical formulas.
+
+  Max 4 hardware/config facts:
+  - Target printer model: QIDI Max 4.
+  - Kinematics: CoreXY for X/Y.
+  - Z axis: bed-moving, not belt-driven.
+  - Toolhead MCU section: `[mcu THR]`, serial `/dev/ttyS4`, baud `500000` in stock configs.
+  - Stock accelerometer: `[lis2dw]` on the toolhead board through THR software SPI pins.
+  - Stock LIS2DW axes map: `y, z, -x`.
+  - Stock `[resonance_tester]`: `accel_chip: lis2dw`, `accel_per_hz: 150`, `max_smoothing: 0.25`, `probe_points: 195,195,10`.
+  - Stock `[printer]`: `kinematics: corexy`, `max_velocity: 800`, `max_accel: 30000`, `max_z_velocity: 10`, `max_z_accel: 500`, `square_corner_velocity: 8`.
+  - Stock X/Y steppers: `microsteps: 32`, `rotation_distance: 39`.
+  - QIDI X/Y motor control uses `[closed_loop x]` and `[closed_loop y]` sections with fields such as `run_current: 1500`, `hold_current: 800`, `home_current: 700`, `microstep: 32`, trigger fields, and query-cycle fields.
+  - Do not require standard `[tmc* stepper_x]` or `[tmc* stepper_y]` sections for X/Y motor metadata.
+  - Z uses TMC2209 sections for Z/Z1 and high microstepping; Z metadata is not used for Shake&Bake X/Y resonance analysis.
+  - Stock saved input shaper values can include X `ei` near 54.4 Hz and Y `mzv` near 36.2 Hz; analyzers must compute recommendations from captures rather than assuming these values.
+  - Typical host: Debian 11 aarch64, 4 Cortex-A35 cores, roughly 486 MiB RAM.
+  - QIDI touchscreen/backend services and optional AI services can consume CPU during acquisition.
+
+  Z-axis stance:
+  - Do not implement Max 4 Z-axis resonance calibration, Z-axis shaper analysis, or Z-axis speed profiling.
+  - The Max 4 Z axis moves the bed and is not belt-driven.
+  - The toolhead-mounted accelerometer does not measure bed Z movement as a useful toolhead resonance signal.
+  - Commands must reject `AXIS=Z` for resonance/shaper acquisition.
+  - Axes-map or sensor-orientation logic may preserve configured axes-map metadata, but must not rely on bed Z movement as a measured toolhead response.
+
+  Safety requirements:
+  - Refuse motion commands when the printer is printing, paused, running virtual-SD work, homing, not ready, in filament-change flow, or in another unsafe active state.
+  - Run preflight before motion commands.
+  - Verify accelerometer availability before acquisition.
+  - Validate probe point and full planned X/Y move envelope against configured bounds with a safety margin.
+  - Snapshot input-shaper state, velocity-limit state, square-corner velocity, fan/heater/chamber state, probe point, accelerometer identity, axes map, and relevant command parameters before acquisition.
+  - Disable input shaper during resonance/vibration measurements and restore it afterward.
+  - Restore velocity limits and supported motion settings through guaranteed cleanup paths after success, command error, motion error, sampling error, or write error.
+  - Use conservative defaults on Max 4: lower sweep rate, bounded frequency range, adequate settle delays, and external analysis.
+  - Add forced-exception tests for every state restoration path.
+
+  Data artifact requirements:
+  - Capture artifacts must be versioned and explicit.
+  - Include `schema_version`, `tool`, `printer_model: qidi_max_4`, creation timestamp, command name, command parameters, planned motion envelope, probe point, axes map, accelerometer object/type, sample-rate estimate, Klipper version/hash when available, QIDI firmware/config fingerprint when available, input-shaper pre-state, velocity-limit pre-state, and fan/heater/chamber snapshot.
+  - Raw sample rows contain time, accel_x, accel_y, accel_z.
+  - Support multiple named measurement blocks in one capture.
+  - Keep artifacts sensor-aware so a second IMU can be added without rewriting capture files.
+  - Validate capture files before analysis for required metadata, expected columns, sample count, monotonic timestamps, finite values, sample-rate range, nonconstant signal, and nonempty frequency-domain data.
+  - Return explicit diagnostics instead of `NaN`, silent success, or uncaught numeric exceptions.
+  - Cover empty data, one-sample data, nonmonotonic time, non-finite samples, constant signals, high-noise data, LIS2DW aliasing-like traces, and Max 4 closed-loop config parsing in fixtures.
+
+  Motion generation model:
+  - Resonance sweep motion alternates positive and negative acceleration segments while excitation frequency increases over time.
+  - Segment duration is approximately a quarter period of the current excitation frequency.
+  - Acceleration magnitude is `accel_per_hz * frequency`.
+  - Static-frequency excitation repeats the same pulse pattern at one frequency for a fixed duration.
+  - CoreXY belt-path directions are A `(1, -1, 0)` and B `(1, 1, 0)`.
+  - CoreXY speed-profile main measured directions are 45 degrees and 135 degrees; projected 0-360 degree profiles use CoreXY motor-speed decomposition.
+
+  Acquisition command map:
+  - `SHAKEANDBAKE_PREFLIGHT`: reports readiness, blocking findings, warnings, supported axes, probe point, accelerometer identity, host resource state, and machine-state snapshots.
+  - `SHAKEANDBAKE_CAPTURE_SHAPER AXIS=X|Y|ALL`: captures X/Y resonance data for external shaper analysis.
+  - `SHAKEANDBAKE_CAPTURE_BELTS`: captures CoreXY A/B belt-path resonance data for external belt comparison.
+  - `SHAKEANDBAKE_CAPTURE_SPEED_PROFILE`: captures speed/direction vibration profile data for external speed-profile analysis.
+  - `SHAKEANDBAKE_EXCITE AXIS=X|Y|A|B FREQUENCY=<hz> DURATION=<sec> RECORD=0|1`: excites one supported X/Y or CoreXY belt-path direction at a static frequency and optionally records raw data.
+  - Commands must avoid dummy macro forwarding and register explicit typed parameters.
+
+  External analyzer command map:
+  - `shakeandbake analyze shaper <capture>` reads X/Y shaper captures and writes analysis JSON, summary text, graphs, and proposed `[input_shaper]` snippets when signal quality supports recommendations.
+  - `shakeandbake analyze belts <capture>` reads CoreXY A/B captures and writes belt PSD comparison, peak pairing, similarity metrics, diagnostics, and graphs.
+  - `shakeandbake analyze speed-profile <capture>` reads speed-profile captures and writes speed-vs-angle vibration metrics, preferred speed ranges, avoid bands, angle summaries, diagnostics, and graphs.
+  - `shakeandbake analyze static-frequency <capture>` reads optional static-frequency recordings and writes spectrogram/energy-over-time outputs.
+
+  Shaper analysis guidance:
+  - Use monotonic sample time and derive sample rate from timestamps.
+  - Remove per-axis DC/gravity offset before frequency-domain processing.
+  - Use Welch PSD or another explicit, fixture-tested PSD method; record window, segment length, overlap, frequency range, and resolution.
+  - Estimate dominant resonance and damping from PSD only when valid half-power crossings exist; for PSD power use half-power `peak / 2` semantics.
+  - Evaluate independently implemented shaper candidates: `zv`, `mzv`, `ei`, `2hump_ei`, and `3hump_ei`.
+  - Report residual vibration estimate, smoothing estimate, acceleration guidance, selected low-vibration candidate, selected performance-oriented candidate, and reasons when recommendations are withheld.
+
+  Belt comparison guidance:
+  - Support Max 4 CoreXY A/B belt-path comparison only.
+  - Acquire A direction `(1, -1, 0)` and B direction `(1, 1, 0)` using the same resonance sweep parameters.
+  - Convert each trace to PSD, interpolate onto a common frequency grid, detect peaks above relative and absolute thresholds, pair peaks by frequency proximity with a bounded threshold, and report paired/unpaired peaks.
+  - Do not rely only on Pearson correlation.
+  - Validate both PSD arrays before comparison; empty, constant, all-zero, or non-finite PSD arrays produce explicit invalid diagnostics.
+  - Compute multiple metrics: paired-peak frequency deltas, paired-peak amplitude ratios, normalized area difference, and correlation only when valid.
+  - Penalize unpaired peaks and excessive peak counts in mechanical-health summaries without presenting a single similarity number as absolute truth.
+  - Include QIDI closed-loop X/Y motor-current metadata when available; skip motor-driver annotations when unavailable.
+
+  Speed-profile guidance:
+  - Measure vibration energy as a function of toolhead speed and movement direction.
+  - CoreXY acquisition uses main directions 45 degrees and 135 degrees.
+  - Sweep speeds from low speed through configured `MAX_SPEED` by `SPEED_INCREMENT`.
+  - Use shorter segment lengths at low speeds and more back-and-forth repetitions at higher speeds to manage duration and sample quality.
+  - Convert each speed/angle measurement into PSD and integrate vibration energy over frequency.
+  - Project measured motor-axis vibration profiles over 0-360 degrees using CoreXY motor-speed decomposition.
+  - Report per-speed minimum, maximum, variance, combined vibration metric, avoid bands around detected peaks, preferred speed ranges, angle-energy summaries, and low-vibration angle ranges.
+  - Treat slicer speed recommendations as conservative vibration guidance requiring print validation.
+  - Keep heavy speed-profile analysis off the printer host.
+
+  Static-frequency excitation guidance:
+  - Support X, Y, A, and B excitation axes.
+  - Move to the resonance-test point, disable input shaper, generate repeated acceleration pulses at the requested fixed frequency, restore state through cleanup paths, and optionally record accelerometer data.
+  - Use the command to help locate resonating components such as toolhead parts, belts, panels, gantry elements, fans, ducts, and cable chains.
+  - Optional analysis produces spectrogram and cumulative energy over time from recorded data.
+
+  LIS2DW concerns:
+  - LIS2DW captures can show aliasing artifacts, parallel resonance-like lines, and noisy low-amplitude traces.
+  - Always estimate and report sample rate.
+  - Include anti-aliasing/noise warnings in analyzer outputs.
+  - Compare repeated captures before declaring mechanical faults.
+  - Prefer metrics that tolerate LIS2DW noise and return uncertainty/diagnostics rather than definitive fault claims.
+  - Allow optional external accelerometer support through sensor-aware artifacts while keeping stock LIS2DW behavior first-class.
+
+  Dependency and host constraints:
+  - Keep scientific dependencies out of `klippy-env`.
+  - Keep heavy plotting and FFT work outside Klipper's reactor and motion timing paths.
+  - Use isolated analyzer environments or workstation execution for numerical processing and graph generation.
+  - Make JSON analysis output authoritative; graph generation failures must be distinct from analysis failures.
+  - Preflight must warn about host load, low memory, low disk, and active services that can affect long acquisition commands.
+
+  Documentation style:
+  - Write docs as current product behavior and technical contracts.
+  - Use finished-product wording rather than provisional or chronology-based language.
+  - Do not reference external implementation names, issue URLs, or source repository names in project docs.
+  - State constraints directly and keep requirements testable.
+
+rules:
+  proposal:
+    - Do not reference external implementation names, issue URLs, or source repository names.
+    - Keep scope as finished product behavior, not chronology or provisional language.
+  design:
+    - Include Max 4, CoreXY, LIS2DW, external-analysis, and no-Z-axis constraints when relevant.
+    - Do not reference external implementation names, issue URLs, or source repository names.
+    - Explain state restoration and dependency boundaries for any printer-side behavior.
+  specs:
+    - Requirements must reject Z-axis resonance/shaper behavior when axis semantics are relevant.
+    - Requirements must keep raw captures separate from derived analysis outputs when data artifacts are involved.
+    - Do not reference external implementation names, issue URLs, or source repository names.
+  tasks:
+    - Keep tasks small enough for one implementation session.
+    - Include fixture and forced-error tests for safety, validation, and numeric edge cases.
+    - Do not reference external implementation names, issue URLs, or source repository names.

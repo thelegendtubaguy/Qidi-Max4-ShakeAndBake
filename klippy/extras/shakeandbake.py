@@ -57,6 +57,36 @@ class CommandError(Exception):
     pass
 
 
+class _ResonanceAxis:
+    def __init__(self, axis: str):
+        self.axis = axis.lower()
+        self.direction = (1.0, 0.0) if self.axis == "x" else (0.0, 1.0)
+
+    def get_name(self) -> str:
+        return self.axis
+
+    def get_point(self, distance: float) -> Tuple[float, float]:
+        return (self.direction[0] * distance, self.direction[1] * distance)
+
+
+class _ResonanceGCmd:
+    def __init__(self, adapter: "KlipperAdapter", params: Mapping[str, Any]):
+        self.adapter = adapter
+        self.params = {str(key).lower(): value for key, value in params.items()}
+
+    def get_float(self, key: str, default: Any = None, **_kwargs: Any) -> float:
+        return float(self.params.get(key.lower(), default))
+
+    def get_int(self, key: str, default: Any = None, **_kwargs: Any) -> int:
+        return int(self.params.get(key.lower(), default))
+
+    def respond_info(self, message: str) -> None:
+        self.adapter.respond(None, message)
+
+    def error(self, message: str) -> CommandError:
+        return CommandError(message)
+
+
 @dataclass(frozen=True)
 class ShaperCaptureParams:
     axes: Tuple[str, ...]
@@ -211,15 +241,25 @@ class KlipperAdapter:
     def __init__(self, config: Any):
         self.config = config
         self.printer = config.get_printer() if hasattr(config, "get_printer") else getattr(config, "printer", None)
-        self.gcode = self.lookup_object("gcode", required=False)
-        self.toolhead = self.lookup_object("toolhead", required=False)
-        self.input_shaper = self.lookup_object("input_shaper", required=False)
-        self.resonance_tester = self.lookup_object("resonance_tester", required=False)
-        self.virtual_sd = self.lookup_object("virtual_sdcard", required=False)
-        self.pause_resume = self.lookup_object("pause_resume", required=False)
+        self.gcode = None
+        self.toolhead = None
+        self.input_shaper = None
+        self.resonance_tester = None
+        self.virtual_sd = None
+        self.pause_resume = None
         self.accelerometer = None
+        self.refresh_objects()
+
+    def refresh_objects(self) -> None:
+        self.gcode = self.lookup_object("gcode", required=False) or self.gcode
+        self.toolhead = self.lookup_object("toolhead", required=False) or self.toolhead
+        self.input_shaper = self.lookup_object("input_shaper", required=False) or self.input_shaper
+        self.resonance_tester = self.lookup_object("resonance_tester", required=False) or self.resonance_tester
+        self.virtual_sd = self.lookup_object("virtual_sdcard", required=False) or self.virtual_sd
+        self.pause_resume = self.lookup_object("pause_resume", required=False) or self.pause_resume
 
     def register_commands(self, owner: "ShakeAndBake") -> None:
+        self.refresh_objects()
         if self.gcode is None or not hasattr(self.gcode, "register_command"):
             raise CommandError("required Klipper gcode object is unavailable")
         self._register_command("SHAKEANDBAKE_PREFLIGHT", owner.cmd_preflight)
@@ -229,10 +269,23 @@ class KlipperAdapter:
         self._register_command("SHAKEANDBAKE_EXCITE", owner.cmd_excite)
 
     def _register_command(self, name: str, callback: Any) -> None:
+        wrapped = self._command_wrapper(callback)
         try:
-            self.gcode.register_command(name, callback, desc=COMMAND_HELP[name])
+            self.gcode.register_command(name, wrapped, desc=COMMAND_HELP[name])
         except TypeError:
-            self.gcode.register_command(name, callback)
+            self.gcode.register_command(name, wrapped)
+
+    def _command_wrapper(self, callback: Any) -> Any:
+        def wrapped(gcmd: Any) -> None:
+            try:
+                callback(gcmd)
+            except CommandError as exc:
+                error = getattr(gcmd, "error", None)
+                if callable(error):
+                    raise error(str(exc))
+                raise
+
+        return wrapped
 
     def lookup_object(self, name: str, required: bool = True) -> Any:
         if self.printer is None:
@@ -254,6 +307,7 @@ class KlipperAdapter:
             return None
 
     def feature_errors(self) -> List[str]:
+        self.refresh_objects()
         errors = []
         if self.gcode is None or not hasattr(self.gcode, "register_command"):
             errors.append("gcode command registration is unavailable")
@@ -266,6 +320,7 @@ class KlipperAdapter:
         return errors
 
     def snapshot(self) -> AdapterSnapshot:
+        self.refresh_objects()
         return AdapterSnapshot(
             printer_ready=self.printer_ready(),
             printing=self.is_printing(),
@@ -303,6 +358,32 @@ class KlipperAdapter:
 
     def is_homing(self) -> bool:
         return bool(_call_or_attr(self.toolhead, "is_homing", default=False) or _call_or_attr(self.printer, "homing", default=False))
+
+    def require_homed_axes(self, axes: Sequence[str]) -> None:
+        homed_axes = self._homed_axes()
+        missing = [axis.lower() for axis in axes if axis.lower() not in homed_axes]
+        if missing:
+            raise CommandError("printer axes must be homed before Shake&Bake capture: " + ",".join(axis.upper() for axis in missing))
+
+    def _homed_axes(self) -> str:
+        reactor = getattr(self.printer, "get_reactor", lambda: None)()
+        monotonic = getattr(reactor, "monotonic", None) if reactor is not None else None
+        eventtime = monotonic() if callable(monotonic) else 0.0
+        for obj in (self.toolhead, self.lookup_object("gcode_move", required=False)):
+            if obj is None:
+                continue
+            get_status = getattr(obj, "get_status", None)
+            if callable(get_status):
+                try:
+                    status = get_status(eventtime)
+                except TypeError:
+                    status = get_status()
+                if isinstance(status, Mapping) and isinstance(status.get("homed_axes"), str):
+                    return status["homed_axes"].lower()
+            homed_axes = getattr(obj, "homed_axes", None)
+            if isinstance(homed_axes, str):
+                return homed_axes.lower()
+        return ""
 
     def accelerometer_available(self) -> bool:
         return self._accelerometer() is not None
@@ -390,14 +471,101 @@ class KlipperAdapter:
         accelerometer = self._accelerometer(params.accel_chip)
         if accelerometer is None:
             raise CommandError("accelerometer is unavailable")
+        payload = params.as_dict()
         move = getattr(self.resonance_tester, "run_axis", None)
         if callable(move):
-            move(axis=axis, params=params.as_dict())
-        acquire = getattr(accelerometer, "acquire_samples", None) or getattr(accelerometer, "read_samples", None)
-        if not callable(acquire):
+            def motion() -> None:
+                move(axis=axis, params=payload)
+
+            return self._capture_axis_samples(accelerometer, axis, payload, motion)
+        if self._has_resonance_test_api():
+            return self._capture_resonance_test_samples(accelerometer, axis, payload)
+        raise CommandError("resonance motion method is unavailable")
+
+    def _has_resonance_test_api(self) -> bool:
+        test = getattr(self.resonance_tester, "test", None)
+        return callable(getattr(test, "prepare_test", None)) and callable(getattr(test, "run_test", None))
+
+    def _capture_resonance_test_samples(self, accelerometer: Any, axis: str, params: Mapping[str, Any]) -> List[Sample]:
+        start_client = getattr(accelerometer, "start_internal_client", None)
+        if not callable(start_client):
             raise CommandError("accelerometer sample acquisition method is unavailable")
-        raw_samples = acquire(axis=axis, params=params.as_dict())
-        return [Sample.from_value(row) for row in raw_samples]
+        self._move_to_resonance_point()
+        client = start_client()
+        finished = False
+        try:
+            gcmd = _ResonanceGCmd(self, params)
+            test = self.resonance_tester.test
+            test.prepare_test(gcmd)
+            test.run_test(_ResonanceAxis(axis), gcmd)
+            finish = getattr(client, "finish_measurements", None)
+            if callable(finish):
+                finish()
+                finished = True
+            get_samples = getattr(client, "get_samples", None)
+            if not callable(get_samples):
+                raise CommandError("accelerometer internal client sample method is unavailable")
+            return [Sample.from_value(row) for row in get_samples()]
+        finally:
+            if not finished:
+                finish = getattr(client, "finish_measurements", None)
+                if callable(finish):
+                    try:
+                        finish()
+                    except Exception:
+                        pass
+
+    def _move_to_resonance_point(self) -> None:
+        test = getattr(self.resonance_tester, "test", None)
+        get_points = getattr(test, "get_start_test_points", None)
+        if not callable(get_points):
+            return
+        points = get_points()
+        if not points:
+            return
+        if self.toolhead is None:
+            raise CommandError("toolhead object is unavailable")
+        move_speed = float(getattr(self.resonance_tester, "move_speed", 50.0) or 50.0)
+        manual_move = getattr(self.toolhead, "manual_move", None)
+        if not callable(manual_move):
+            raise CommandError("toolhead manual_move method is unavailable")
+        manual_move(points[0], move_speed)
+        wait_moves = getattr(self.toolhead, "wait_moves", None)
+        if callable(wait_moves):
+            wait_moves()
+        dwell = getattr(self.toolhead, "dwell", None)
+        if callable(dwell):
+            dwell(0.500)
+
+    def _capture_axis_samples(self, accelerometer: Any, axis: str, params: Mapping[str, Any], motion: Any) -> List[Sample]:
+        acquire = getattr(accelerometer, "acquire_samples", None) or getattr(accelerometer, "read_samples", None)
+        if callable(acquire):
+            motion()
+            raw_samples = acquire(axis=axis, params=params)
+            return [Sample.from_value(row) for row in raw_samples]
+        start_client = getattr(accelerometer, "start_internal_client", None)
+        if not callable(start_client):
+            raise CommandError("accelerometer sample acquisition method is unavailable")
+        client = start_client()
+        finished = False
+        try:
+            motion()
+            finish = getattr(client, "finish_measurements", None)
+            if callable(finish):
+                finish()
+                finished = True
+            get_samples = getattr(client, "get_samples", None)
+            if not callable(get_samples):
+                raise CommandError("accelerometer internal client sample method is unavailable")
+            return [Sample.from_value(row) for row in get_samples()]
+        finally:
+            if not finished:
+                finish = getattr(client, "finish_measurements", None)
+                if callable(finish):
+                    try:
+                        finish()
+                    except Exception:
+                        pass
 
     def acquire_belt_path_samples(self, path: str, direction: Tuple[int, int, int], params: BeltCaptureParams) -> List[Sample]:
         accelerometer = self._accelerometer(params.accel_chip)
@@ -624,6 +792,7 @@ class ShakeAndBake:
         feature_errors = self.adapter.feature_errors()
         if feature_errors:
             raise CommandError("Shake&Bake feature detection failed: " + "; ".join(feature_errors))
+        self.adapter.require_homed_axes(params.axes)
 
         measurements: List[MeasurementBlock] = []
         restoration_status = RestorationStatus()

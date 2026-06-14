@@ -15,6 +15,10 @@ from shakeandbake_max4 import parse_max4_config
 FIXTURES = Path(__file__).parent / "fixtures" / "max4"
 
 
+class FakeGCodeCommandError(Exception):
+    pass
+
+
 class FakeGCode:
     def __init__(self) -> None:
         self.commands = {}
@@ -44,12 +48,19 @@ class FakeGCmd:
     def respond_info(self, message: str) -> None:
         self.responses.append(message)
 
+    def error(self, message: str) -> FakeGCodeCommandError:
+        return FakeGCodeCommandError(message)
+
 
 class FakeToolhead:
     def __init__(self) -> None:
         self.velocity_limits = {"max_velocity": 600.0, "max_accel": 20000.0, "square_corner_velocity": 5.0}
         self.restores = 0
         self.fail_restore = False
+        self.homed_axes = "xyz"
+        self.manual_moves = []
+        self.waits = 0
+        self.dwells = []
 
     def snapshot_velocity_limits(self):
         return dict(self.velocity_limits)
@@ -65,6 +76,26 @@ class FakeToolhead:
 
     def get_position(self):
         return (195.0, 195.0, 10.0)
+
+    def get_status(self, _eventtime=0.0):
+        return {"homed_axes": self.homed_axes}
+
+    def manual_move(self, point, speed) -> None:
+        self.manual_moves.append((tuple(point), speed))
+
+    def wait_moves(self) -> None:
+        self.waits += 1
+
+    def dwell(self, seconds) -> None:
+        self.dwells.append(seconds)
+
+
+class FakeReactor:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
 
 
 class FakeInputShaper:
@@ -102,6 +133,28 @@ class FakeAccelerometer:
         return self.samples_by_axis[axis]
 
 
+class FakeInternalClient:
+    def __init__(self, samples) -> None:
+        self.samples = samples
+        self.finished = False
+
+    def finish_measurements(self) -> None:
+        self.finished = True
+
+    def get_samples(self):
+        return self.samples
+
+
+class FakeInternalAccelerometer:
+    def __init__(self) -> None:
+        self.clients = []
+
+    def start_internal_client(self):
+        client = FakeInternalClient([[0.000, 0.10, 0.02, 9.80], [0.001, 0.15, 0.03, 9.81], [0.002, 0.09, 0.04, 9.79]])
+        self.clients.append(client)
+        return client
+
+
 class FakeResonanceTester:
     def __init__(self) -> None:
         self.moves = []
@@ -112,6 +165,29 @@ class FakeResonanceTester:
         if self.fail or axis.upper() == self.fail_path:
             raise RuntimeError("motion failure")
         self.moves.append((axis, params))
+
+
+class FakeMax4ResonanceTest:
+    def __init__(self) -> None:
+        self.prepared = []
+        self.runs = []
+        self.points = [(195.0, 195.0, 10.0)]
+
+    def get_start_test_points(self):
+        return self.points
+
+    def prepare_test(self, gcmd) -> None:
+        self.prepared.append((gcmd.get_float("FREQ_START"), gcmd.get_float("FREQ_END")))
+
+    def run_test(self, axis, gcmd) -> None:
+        self.runs.append((axis.get_name(), axis.get_point(2.0)))
+        gcmd.respond_info("Testing frequency 5 Hz")
+
+
+class FakeMax4ResonanceTester:
+    def __init__(self) -> None:
+        self.test = FakeMax4ResonanceTest()
+        self.move_speed = 50.0
 
 
 class FakePrinter:
@@ -134,6 +210,7 @@ class FakePrinter:
         self.fan_state = {"part": 0.0}
         self.heater_state = {"extruder": {"temperature": 25.0, "target": 0.0}}
         self.chamber_state = {"temperature": 27.0}
+        self.reactor = FakeReactor()
 
     def is_ready(self) -> bool:
         return self.ready
@@ -144,6 +221,9 @@ class FakePrinter:
         if default is not None:
             return default
         raise KeyError(name)
+
+    def get_reactor(self):
+        return self.reactor
 
 
 class FakeConfig:
@@ -170,6 +250,15 @@ class KlipperDataAcquisitionTests(unittest.TestCase):
         self.assertIn("SHAKEANDBAKE_CAPTURE_SHAPER", printer.gcode.commands)
         self.assertIn("SHAKEANDBAKE_CAPTURE_BELTS", printer.gcode.commands)
         self.assertIn("SHAKEANDBAKE_EXCITE", printer.gcode.commands)
+
+    def test_registered_commands_raise_gcode_errors_not_internal_errors(self) -> None:
+        printer = FakePrinter()
+        load_plugin(printer)
+
+        with self.assertRaisesRegex(FakeGCodeCommandError, "supports AXIS=X, AXIS=Y, or AXIS=ALL"):
+            printer.gcode.commands["SHAKEANDBAKE_CAPTURE_SHAPER"](
+                FakeGCmd(AXIS="Z", OUTPUT_DIR=tempfile.gettempdir())
+            )
 
     def test_plugin_import_does_not_import_heavy_or_analyzer_modules(self) -> None:
         script = """
@@ -242,6 +331,52 @@ raise SystemExit(1 if loaded else 0)
         with self.assertRaisesRegex(module.CommandError, "accelerometer_unavailable|feature detection"):
             plugin.cmd_capture_shaper(FakeGCmd(AXIS="X", OUTPUT_DIR=tempfile.gettempdir()))
         self.assertEqual(printer.resonance_tester.moves, [])
+
+    def test_capture_refuses_unhomed_axes_before_sensor_start(self) -> None:
+        printer = FakePrinter()
+        printer.toolhead.homed_axes = ""
+        printer.lis2dw = FakeInternalAccelerometer()
+        module, plugin = load_plugin(printer)
+
+        with self.assertRaisesRegex(module.CommandError, "must be homed"):
+            plugin.cmd_capture_shaper(FakeGCmd(AXIS="X", OUTPUT_DIR=tempfile.gettempdir()))
+        self.assertEqual(printer.lis2dw.clients, [])
+
+    def test_capture_supports_max4_internal_accelerometer_and_resonance_test_api(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            printer = FakePrinter()
+            printer.resonance_tester = FakeMax4ResonanceTester()
+            printer.lis2dw = FakeInternalAccelerometer()
+            _, plugin = load_plugin(printer)
+            cmd = FakeGCmd(AXIS="X", OUTPUT_DIR=temp_dir)
+
+            plugin.cmd_capture_shaper(cmd)
+
+            captures = list(Path(temp_dir).glob("*.sbcapture.json"))
+            self.assertEqual(len(captures), 1)
+            self.assertEqual(printer.toolhead.manual_moves, [((195.0, 195.0, 10.0), 50.0)])
+            self.assertEqual(printer.toolhead.waits, 1)
+            self.assertEqual(printer.toolhead.dwells, [0.5])
+            self.assertTrue(printer.lis2dw.clients[0].finished)
+            self.assertEqual(printer.resonance_tester.test.prepared, [(5.0, 120.0)])
+            self.assertEqual(printer.resonance_tester.test.runs, [("x", (2.0, 0.0))])
+            self.assertIn("Testing frequency 5 Hz", printer.gcode.responses)
+            self.assertIn("capture complete", cmd.responses[-1])
+
+    def test_capture_refreshes_klipper_objects_available_after_load(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            printer = FakePrinter()
+            delayed_toolhead = printer.toolhead
+            printer.toolhead = None
+            _, plugin = load_plugin(printer)
+            printer.toolhead = delayed_toolhead
+            cmd = FakeGCmd(AXIS="X", OUTPUT_DIR=temp_dir)
+
+            plugin.cmd_capture_shaper(cmd)
+
+            captures = list(Path(temp_dir).glob("*.sbcapture.json"))
+            self.assertEqual(len(captures), 1)
+            self.assertIn("capture complete", cmd.responses[0])
 
     def test_successful_axis_x_y_and_all_capture_artifacts(self) -> None:
         cases = [("X", ["x_shaper"]), ("Y", ["y_shaper"]), ("ALL", ["x_shaper", "y_shaper"])]

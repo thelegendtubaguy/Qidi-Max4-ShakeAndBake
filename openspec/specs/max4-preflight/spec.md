@@ -16,6 +16,14 @@ The system SHALL inspect QIDI Max 4 configuration values required for Shake&Bake
 - **WHEN** a Max 4 config contains `[resonance_tester]`
 - **THEN** preflight config inspection extracts accel chip, accel per Hz, max smoothing, and probe point values when present
 
+#### Scenario: Multiline probe points are parsed
+- **WHEN** a Max 4 config stores `probe_points` as a multiline Klipper option
+- **THEN** preflight config inspection extracts the first probe point as the primary probe point
+
+#### Scenario: Klipper fileconfig is parsed
+- **WHEN** the Klipper extra receives a loaded Klipper `fileconfig` object
+- **THEN** Max 4 configuration inspection can build the same config summary used for preflight without requiring a separate config file path
+
 #### Scenario: LIS2DW section is parsed
 - **WHEN** a Max 4 config contains `[lis2dw]`
 - **THEN** preflight config inspection extracts axes map and accelerometer identity fields when present
@@ -45,6 +53,10 @@ The system SHALL return a structured preflight result with readiness, blocking f
 #### Scenario: Host resource warning is emitted
 - **WHEN** host load, free memory, or free disk is below the configured warning threshold but not a known unsafe state
 - **THEN** preflight returns a warning with the metric name and observed value
+
+#### Scenario: Host resource metrics are read from Linux
+- **WHEN** Klipper printer objects do not expose host load, free memory, or free disk metrics
+- **THEN** preflight reads host load, available memory, and available disk from the Linux runtime when available
 
 ### Requirement: Planned Motion Envelope Validation
 The system SHALL validate planned X/Y acquisition movement against Max 4 configured travel limits and probe point.

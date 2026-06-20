@@ -1,7 +1,7 @@
 # external-shaper-analysis Specification
 
 ## Purpose
-External shaper analysis reads Shake&Bake raw X/Y captures outside Klipper and writes derived recommendations, diagnostics, summaries, and graphs without contacting the printer or editing configuration.
+External shaper analysis reads Shake&Bake raw X/Y captures outside Klipper and writes derived frequency evidence, diagnostics, summaries, and graphs without contacting the printer or editing configuration.
 
 ## Requirements
 
@@ -45,6 +45,17 @@ The system SHALL compute PSD summaries for valid X/Y measurements.
 - **WHEN** PSD values are empty, constant, all zero, or non-finite
 - **THEN** the analyzer records an invalid PSD diagnostic and does not produce a recommendation for that axis
 
+### Requirement: Frequency Evidence Reporting
+The system SHALL report detected resonance-frequency evidence independently from shaper recommendation confidence.
+
+#### Scenario: Peaks are detected
+- **WHEN** PSD analysis finds local maxima above the configured thresholds
+- **THEN** analysis JSON and the human-readable summary include the highest detected peak frequencies for each axis
+
+#### Scenario: Graphs are generated
+- **WHEN** graph output is enabled and an axis has PSD data
+- **THEN** the analyzer writes SVG graphs with frequency axes, dB-scaled response, gridlines, and labeled detected peak frequencies
+
 ### Requirement: Shaper Candidate Evaluation
 The system SHALL evaluate input-shaper candidates for valid X/Y PSD data.
 
@@ -59,6 +70,10 @@ The system SHALL evaluate input-shaper candidates for valid X/Y PSD data.
 #### Scenario: Recommendation is withheld
 - **WHEN** no candidate satisfies configured constraints or metrics are invalid
 - **THEN** the analyzer records a diagnostic and omits a recommendation for that axis
+
+#### Scenario: Recommendation limits are explicit
+- **WHEN** the analyzer emits a proposed input-shaper config snippet
+- **THEN** the summary and JSON preserve the detected peak evidence so operators can compare the output against printer-side calibration results before applying changes
 
 ### Requirement: Damping Estimate
 The system SHALL estimate resonance damping from PSD data using half-power bandwidth where valid.

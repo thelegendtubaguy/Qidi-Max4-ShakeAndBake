@@ -1,6 +1,6 @@
 # Shake&Bake
 
-Shake&Bake captures QIDI Max 4 resonance, belt, static-frequency, and speed-limit evidence from Klipper, then analyzes the raw captures outside the printer process.
+Shake&Bake captures QIDI Max 4 resonance, belt, and speed-limit evidence from Klipper, then analyzes the raw captures outside the printer process.
 
 The printer-side Klipper extra writes immutable `.sbcapture.json` files. The external analyzer writes derived JSON, summaries, SVG graphs, and proposed config snippets without modifying `printer.cfg`.
 
@@ -20,10 +20,10 @@ Copy the Klipper extra and its lightweight support packages into the Klipper sou
 ```sh
 # Run from this repository on your workstation.
 PRINTER=printer-hostname-or-ip
-KLIPPER=/home/mks/klipper
+KLIPPER=/home/qidi/klipper
 
 rsync -a klippy/extras/shakeandbake.py "$PRINTER:$KLIPPER/klippy/extras/"
-rsync -a shakeandbake_capture shakeandbake_max4 "$PRINTER:$KLIPPER/"
+rsync -a shakeandbake_capture shakeandbake_max4 "$PRINTER:$KLIPPER/klippy/"
 ```
 
 Add the extra to `printer.cfg`:
@@ -72,6 +72,7 @@ X/Y input-shaper capture:
 
 ```gcode
 SHAKEANDBAKE_CAPTURE_SHAPER AXIS=ALL OUTPUT_DIR=/tmp/shakeandbake-captures
+# Default sweep: FREQ_START=5 FREQ_END=133 HZ_PER_SEC=1
 ```
 
 CoreXY A/B belt-path capture:
@@ -84,12 +85,6 @@ Speed-limit evidence capture:
 
 ```gcode
 SHAKEANDBAKE_CAPTURE_SPEED_LIMITS MAX_SPEED=300 SPEED_INCREMENT=100 ACCEL_MIN=5000 ACCEL_MAX=15000 ACCEL_INCREMENT=5000 OUTPUT_DIR=/tmp/shakeandbake-captures
-```
-
-Static-frequency excitation with recording:
-
-```gcode
-SHAKEANDBAKE_EXCITE AXIS=X FREQUENCY=45 DURATION=10 RECORD=1 OUTPUT_DIR=/tmp/shakeandbake-captures
 ```
 
 Copy captures from the printer:
@@ -121,12 +116,6 @@ Speed-limit analysis:
 python -m shakeandbake_analyze analyze speed-limits captures/speed-limits-YYYYMMDDTHHMMSSZ.sbcapture.json --output-dir out/speed-limits
 ```
 
-Static-frequency analysis:
-
-```sh
-python -m shakeandbake_analyze analyze static-frequency captures/static-x-45hz-YYYYMMDDTHHMMSSZ.sbcapture.json --output-dir out/static-x-45hz
-```
-
 Useful options:
 
 ```sh
@@ -136,7 +125,7 @@ Useful options:
 
 Analyzer outputs include:
 
-- `analysis-shaper.json`, `analysis-belts.json`, `analysis-speed-limits.json`, or `analysis-static-frequency.json`
+- `analysis-shaper.json`, `analysis-belts.json`, or `analysis-speed-limits.json`
 - `summary.txt` unless `--json-only` is used
 - `graphs/*.svg` unless graph output is disabled
 - `input-shaper.proposed.cfg` for shaper recommendations

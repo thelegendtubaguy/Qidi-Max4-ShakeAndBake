@@ -52,6 +52,16 @@ class Max4ConfigParsingTests(unittest.TestCase):
         self.assertEqual(config.motors["y"].home_current, 0.85)
         self.assertEqual(config.motors["y"].microsteps, 16)
 
+    def test_multiline_probe_points_parse(self) -> None:
+        config = parse_max4_config("""
+[resonance_tester]
+accel_chip: lis2dw
+probe_points:
+    195, 195, 10
+""")
+
+        self.assertEqual(config.resonance_tester.primary_probe_point, (195.0, 195.0, 10.0))
+
 
 class Max4PreflightTests(unittest.TestCase):
     def setUp(self) -> None:

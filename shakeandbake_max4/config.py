@@ -104,6 +104,7 @@ def parse_max4_config(source: str | Path) -> Max4ConfigSummary:
 def _parse_klipper_ini(text: str) -> Dict[str, Dict[str, str]]:
     sections: Dict[str, Dict[str, str]] = {}
     current: Optional[str] = None
+    current_key: Optional[str] = None
     for raw_line in text.splitlines():
         line = _strip_comment(raw_line).strip()
         if not line:
@@ -111,6 +112,7 @@ def _parse_klipper_ini(text: str) -> Dict[str, Dict[str, str]]:
         if line.startswith("[") and line.endswith("]"):
             current = line[1:-1].strip().lower()
             sections.setdefault(current, {})
+            current_key = None
             continue
         if current is None:
             continue
@@ -118,9 +120,13 @@ def _parse_klipper_ini(text: str) -> Dict[str, Dict[str, str]]:
             key, value = line.split(":", 1)
         elif "=" in line:
             key, value = line.split("=", 1)
+        elif current_key and raw_line[:1].isspace():
+            sections[current][current_key] = f"{sections[current][current_key]}\n{line}".strip()
+            continue
         else:
             continue
-        sections[current][key.strip().lower()] = value.strip()
+        current_key = key.strip().lower()
+        sections[current][current_key] = value.strip()
     return sections
 
 

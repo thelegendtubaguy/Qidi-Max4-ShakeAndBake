@@ -149,6 +149,10 @@ The system SHALL include vibration evidence needed to constrain print-quality re
 - **WHEN** the default speed-limit evidence run reaches the shaper phase
 - **THEN** the artifact includes X and Y resonance measurement blocks compatible with external shaper analysis
 
+#### Scenario: Default embedded shaper sweep range matches Max 4 calibration range
+- **WHEN** the default speed-limit evidence run captures embedded X/Y shaper measurements
+- **THEN** the embedded shaper sweep uses a default end frequency of `133 Hz`
+
 #### Scenario: Speed-profile grid is validated
 - **WHEN** the speed-profile phase builds its speed grid from command parameters
 - **THEN** the grid contains positive speeds through the requested maximum, uses a positive increment, stays within configured printer limits, and stays under the measurement-count limit before motion starts
@@ -160,6 +164,10 @@ The system SHALL include vibration evidence needed to constrain print-quality re
 #### Scenario: Speed-profile measurements are captured
 - **WHEN** the default speed-limit evidence run reaches the speed-profile phase
 - **THEN** the artifact includes raw speed/direction vibration measurement blocks for Max 4 CoreXY 45 degree and 135 degree directions across the planned speed grid
+
+#### Scenario: Internal accelerometer sampling is supported
+- **WHEN** the LIS2DW object exposes `start_internal_client` for speed-profile vibration measurements
+- **THEN** the capture starts an internal accelerometer client before motion and finishes measurements before reading samples
 
 #### Scenario: Speed-profile measurement metadata is complete
 - **WHEN** a speed-profile measurement block is written

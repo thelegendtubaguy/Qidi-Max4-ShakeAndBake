@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import cmath
 import hashlib
+import html
 import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import median
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from shakeandbake_capture import CaptureArtifact, MeasurementBlock, Sample, read_capture_artifact
@@ -191,12 +191,22 @@ def _center_samples(samples: Sequence[Sample]) -> List[float]:
         [sample.accel_y for sample in samples],
         [sample.accel_z for sample in samples],
     ]
-    centered = [[value - median(channel) for value in channel] for channel in channels]
+    medians = [_median(channel) for channel in channels]
+    centered = [[value - channel_median for value in channel] for channel, channel_median in zip(channels, medians)]
     return max(centered, key=lambda channel: sum(value * value for value in channel))
 
 
+def _median(values: Sequence[float]) -> float:
+    ordered = sorted(values)
+    size = len(ordered)
+    midpoint = size // 2
+    if size % 2:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+
+
 def _welch_psd(values: Sequence[float], sample_rate: float, options: ShaperAnalysisOptions) -> Tuple[List[float], List[float], Dict[str, Any]]:
-    segment_length = min(256, _largest_power_of_two(len(values)))
+    segment_length = min(2048, _largest_power_of_two(len(values)))
     if segment_length < 8:
         return [], [], {"window": "hann", "segment_length": segment_length, "overlap": 0}
     overlap = segment_length // 2
@@ -234,7 +244,18 @@ def _welch_psd(values: Sequence[float], sample_rate: float, options: ShaperAnaly
 
 def _dft(values: Sequence[float]) -> List[complex]:
     size = len(values)
-    return [sum(value * cmath.exp(-2j * math.pi * k * n / size) for n, value in enumerate(values)) for k in range(size)]
+    if size <= 1:
+        return [complex(value) for value in values]
+    if size % 2:
+        return [sum(value * cmath.exp(-2j * math.pi * k * n / size) for n, value in enumerate(values)) for k in range(size)]
+    even = _dft(values[0::2])
+    odd = _dft(values[1::2])
+    combined = [0j] * size
+    for index in range(size // 2):
+        factor = cmath.exp(-2j * math.pi * index / size) * odd[index]
+        combined[index] = even[index] + factor
+        combined[index + size // 2] = even[index] - factor
+    return combined
 
 
 def _hann(size: int) -> List[float]:
@@ -383,7 +404,7 @@ def _write_outputs(
             psd = axis_result.get("psd")
             if psd:
                 graph = graphs_dir / f"{axis}-psd.svg"
-                _write_svg_graph(graph, psd["frequencies_hz"], psd["values"], f"{axis.upper()} PSD")
+                _write_svg_graph(graph, psd["frequencies_hz"], psd["values"], f"{axis.upper()} PSD", axis_result.get("peaks", [])[:5])
                 graph_paths.append(str(graph))
         if recommendations:
             graph = graphs_dir / "candidate-summary.svg"
@@ -414,21 +435,61 @@ def _write_outputs(
     )
 
 
-def _write_svg_graph(path: Path, frequencies: Sequence[float], values: Sequence[float], title: str) -> None:
-    width, height = 640, 320
-    max_value = max(values) if values else 1.0
+def _write_svg_graph(
+    path: Path,
+    frequencies: Sequence[float],
+    values: Sequence[float],
+    title: str,
+    peaks: Sequence[Mapping[str, Any]] = (),
+) -> None:
+    width, height = 960, 520
+    left, right, top, bottom = 64, 24, 48, 56
+    plot_width = width - left - right
+    plot_height = height - top - bottom
     min_frequency = min(frequencies) if frequencies else 0.0
     max_frequency = max(frequencies) if frequencies else 1.0
-    points = []
-    for frequency, value in zip(frequencies, values):
-        x = 40 + (frequency - min_frequency) / max(max_frequency - min_frequency, 1e-9) * (width - 60)
-        y = height - 30 - value / max(max_value, 1e-18) * (height - 60)
-        points.append(f"{x:.1f},{y:.1f}")
-    path.write_text(
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">'
-        f'<text x="20" y="24">{title}</text><polyline fill="none" stroke="black" points="{" ".join(points)}"/></svg>\n',
-        encoding="utf-8",
-    )
+    max_value = max(values) if values else 1.0
+    floor_db = -60.0
+
+    def x_pos(frequency: float) -> float:
+        return left + (frequency - min_frequency) / max(max_frequency - min_frequency, 1e-9) * plot_width
+
+    def db(value: float) -> float:
+        return max(floor_db, 10.0 * math.log10(max(value, 1e-30) / max(max_value, 1e-30)))
+
+    def y_pos(value: float) -> float:
+        return top + (-db(value) / -floor_db) * plot_height
+
+    points = [f"{x_pos(f):.1f},{y_pos(v):.1f}" for f, v in zip(frequencies, values)]
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        f'<text x="{left}" y="28" font-family="monospace" font-size="18">{html.escape(title)}</text>',
+        f'<line x1="{left}" y1="{top + plot_height}" x2="{left + plot_width}" y2="{top + plot_height}" stroke="#222"/>',
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_height}" stroke="#222"/>',
+    ]
+    for db_tick in (0, -10, -20, -30, -40, -50, -60):
+        y = top + (-db_tick / -floor_db) * plot_height
+        parts.append(f'<line x1="{left}" y1="{y:.1f}" x2="{left + plot_width}" y2="{y:.1f}" stroke="#e8e8e8"/>')
+        parts.append(f'<text x="12" y="{y + 4:.1f}" font-family="monospace" font-size="12">{db_tick} dB</text>')
+    tick_start = int(math.ceil(min_frequency / 10.0) * 10)
+    tick_end = int(math.floor(max_frequency / 10.0) * 10)
+    for freq in range(tick_start, tick_end + 1, 10):
+        x = x_pos(float(freq))
+        parts.append(f'<line x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{top + plot_height}" stroke="#f0f0f0"/>')
+        parts.append(f'<text x="{x - 10:.1f}" y="{height - 24}" font-family="monospace" font-size="12">{freq}</text>')
+    parts.append(f'<text x="{left + plot_width / 2 - 48:.1f}" y="{height - 8}" font-family="monospace" font-size="12">frequency Hz</text>')
+    parts.append(f'<polyline fill="none" stroke="#111" stroke-width="1.5" points="{" ".join(points)}"/>')
+    peak_lookup = {round(float(peak.get("frequency_hz", 0.0)), 6): peak for peak in peaks}
+    for peak in peak_lookup.values():
+        frequency = float(peak.get("frequency_hz", 0.0))
+        energy = float(peak.get("energy", 0.0))
+        x, y = x_pos(frequency), y_pos(energy)
+        label = f'{frequency:.1f} Hz'
+        parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="#d22"/>')
+        parts.append(f'<text x="{min(x + 6, width - 96):.1f}" y="{max(y - 8, 16):.1f}" font-family="monospace" font-size="12" fill="#d22">{label}</text>')
+    parts.append("</svg>")
+    path.write_text("\n".join(parts) + "\n", encoding="utf-8")
 
 
 def _write_candidate_graph(path: Path, axes: Mapping[str, Mapping[str, Any]]) -> None:
@@ -451,6 +512,9 @@ def _summary_text(analysis: Mapping[str, Any]) -> str:
             lines.append(f"Recommendation: {rec['selected_shaper']} @ {rec['frequency_hz']:.2f} Hz")
         else:
             lines.append("Recommendation: unavailable")
+        peaks = result.get("peaks", [])[:5]
+        if peaks:
+            lines.append("Detected peaks: " + ", ".join(f"{peak['frequency_hz']:.2f} Hz" for peak in peaks))
         lines.append("")
     if analysis.get("warnings"):
         lines.append("Warnings:")

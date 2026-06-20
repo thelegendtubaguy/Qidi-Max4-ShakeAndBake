@@ -30,6 +30,21 @@ The system SHALL use matched resonance sweep parameters for A and B path measure
 - **WHEN** `FREQ_START`, `FREQ_END`, `HZ_PER_SEC`, `ACCEL_PER_HZ`, `TRAVEL_SPEED`, or `ACCEL_CHIP` is provided
 - **THEN** both A and B measurement blocks record the same parameter values
 
+#### Scenario: Default belt sweep range matches Max 4 calibration range
+- **WHEN** `SHAKEANDBAKE_CAPTURE_BELTS` runs without `FREQ_END`
+- **THEN** both A and B captures use a default sweep ending at `133 Hz`
+
+### Requirement: Max 4 Internal Accelerometer Capture
+The system SHALL support QIDI Max 4 internal accelerometer sampling APIs for belt-path acquisition.
+
+#### Scenario: Internal client sampling is available
+- **WHEN** the LIS2DW object exposes `start_internal_client` and the resonance tester exposes `test.prepare_test` and `test.run_test`
+- **THEN** belt-path capture starts an internal accelerometer client before A/B motion and finishes measurements before reading samples
+
+#### Scenario: Direct sample acquisition is available
+- **WHEN** the accelerometer object exposes direct `acquire_samples` or `read_samples`
+- **THEN** belt-path capture uses that method to read samples after A/B motion
+
 ### Requirement: Unsafe State Refusal
 The system SHALL refuse belt-path acquisition when preflight returns blocking findings.
 

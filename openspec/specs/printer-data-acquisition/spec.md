@@ -10,7 +10,11 @@ The system SHALL register explicit Shake&Bake data-acquisition commands in Klipp
 
 #### Scenario: Plugin loads
 - **WHEN** the `shakeandbake` Klipper extra is loaded
-- **THEN** `SHAKEANDBAKE_PREFLIGHT` and `SHAKEANDBAKE_CAPTURE_SHAPER` are registered gcode commands
+- **THEN** `SHAKEANDBAKE_PREFLIGHT`, `SHAKEANDBAKE_CAPTURE_SHAPER`, `SHAKEANDBAKE_CAPTURE_BELTS`, and `SHAKEANDBAKE_CAPTURE_SPEED_LIMITS` are registered gcode commands
+
+#### Scenario: Removed diagnostic commands are absent
+- **WHEN** the `shakeandbake` Klipper extra is loaded
+- **THEN** no static-frequency excitation command is registered
 
 #### Scenario: Heavy packages are absent from plugin imports
 - **WHEN** the Klipper plugin module is imported
@@ -37,6 +41,10 @@ The system SHALL capture raw accelerometer data for X and Y shaper analysis thro
 #### Scenario: Capture one axis
 - **WHEN** `SHAKEANDBAKE_CAPTURE_SHAPER AXIS=X` or `AXIS=Y` runs after successful preflight
 - **THEN** the command records only the requested X or Y measurement block and writes one versioned capture artifact
+
+#### Scenario: Default shaper sweep range matches Max 4 calibration range
+- **WHEN** `SHAKEANDBAKE_CAPTURE_SHAPER` runs without `FREQ_END`
+- **THEN** the capture uses a default sweep ending at `133 Hz`
 
 #### Scenario: Capture output path is reported
 - **WHEN** capture artifact writing succeeds
